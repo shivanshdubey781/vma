@@ -1,0 +1,239 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VMA Dual Crossover Dashboard</title>
+<meta name="description" content="Production-ready VMA crossover dashboard for Nifty 50 simulations.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@500;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/index.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">VMA Engine</p>
+        <h1>Dual crossover control room</h1>
+      </div>
+      <div class="topbar-meta">
+        <span class="badge badge-live" id="liveBadge">READY</span>
+        <span class="badge">NIFTY 50</span>
+      </div>
+    </header>
+
+    <section class="status-card" id="statusBox">Loading dashboard...</section>
+
+    <main class="layout">
+      <section class="primary-column">
+        <section class="panel controls-panel">
+          <div class="panel-head">
+            <h2>Market Inputs</h2>
+            <button class="ghost-btn" id="calcBtn" type="button">Calculate</button>
+          </div>
+          <div class="controls-grid">
+            <div class="field-group">
+              <label for="timeframe">Timeframe</label>
+              <select id="timeframe">
+                <option value="1min">1 Minute</option>
+                <option value="3min">3 Minute</option>
+                <option value="5min" selected>5 Minute</option>
+              </select>
+            </div>
+            <div class="field-group">
+              <label for="shortLen">Short VMA</label>
+              <input id="shortLen" type="number" min="1" value="9">
+            </div>
+            <div class="field-group">
+              <label for="longLen">Long VMA</label>
+              <input id="longLen" type="number" min="2" value="21">
+            </div>
+            <div class="field-group">
+              <label for="refreshInterval">Poll Every</label>
+              <select id="refreshInterval">
+                <option value="5000">5 sec</option>
+                <option value="10000" selected>10 sec</option>
+                <option value="15000">15 sec</option>
+              </select>
+            </div>
+          </div>
+        </section>
+
+        <section class="hero-grid">
+          <article class="hero-card">
+            <p class="hero-label">Latest Signal</p>
+            <div class="hero-value" id="heroSignal">-</div>
+            <p class="hero-subtext" id="heroTimestamp">Waiting for data</p>
+          </article>
+          <article class="hero-card">
+            <p class="hero-label">Short / Long VMA</p>
+            <div class="hero-value mono" id="heroVma">-</div>
+            <p class="hero-subtext" id="heroPosition">-</p>
+          </article>
+          <article class="hero-card">
+            <p class="hero-label">Close / RSI</p>
+            <div class="hero-value mono" id="heroClose">-</div>
+            <p class="hero-subtext" id="heroRsi">-</p>
+          </article>
+          <article class="hero-card">
+            <p class="hero-label">Quality / Sideways</p>
+            <div class="hero-value mono" id="heroQuality">-</div>
+            <p class="hero-subtext" id="heroSideways">-</p>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Signal History</h2>
+            <span class="mono subtle" id="historyMeta">No bars loaded</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Close</th>
+                  <th>Short</th>
+                  <th>Long</th>
+                  <th>Signal</th>
+                  <th>Confirm</th>
+                  <th>Quality</th>
+                </tr>
+              </thead>
+              <tbody id="historyTable"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Simulation Result</h2>
+            <span class="mono subtle" id="resultMeta">No simulation yet</span>
+          </div>
+          <div class="stats-grid">
+            <article class="stat-card"><span>Trades</span><strong id="statTrades">0</strong></article>
+            <article class="stat-card"><span>Win Rate</span><strong id="statWinRate">-</strong></article>
+            <article class="stat-card"><span>Net P&amp;L</span><strong id="statPnl">-</strong></article>
+            <article class="stat-card"><span>Best</span><strong id="statBest">-</strong></article>
+            <article class="stat-card"><span>Worst</span><strong id="statWorst">-</strong></article>
+            <article class="stat-card"><span>R:R</span><strong id="statRR">-</strong></article>
+          </div>
+          <div class="active-trade" id="activeTradeCard">
+            <h3>Active Position</h3>
+            <div class="active-grid" id="activeTradeGrid"></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Type</th>
+                  <th>Entry Time</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>SL</th>
+                  <th>Target</th>
+                  <th>Lot</th>
+                  <th>P&amp;L</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="tradesTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <aside class="panel side-panel">
+        <div class="panel-head">
+          <h2>Simulation Controls</h2>
+          <button class="ghost-btn" id="resetBtn" type="button">Reset</button>
+        </div>
+        <div class="side-form">
+          <div class="field-group">
+            <label for="inpInstrument">Instrument</label>
+            <select id="inpInstrument">
+              <option value="options" selected>Options</option>
+              <option value="futures">Futures</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field-group">
+              <label for="inpSL">Stop Loss</label>
+              <input id="inpSL" type="number" min="1" value="20">
+            </div>
+            <div class="field-group">
+              <label for="inpTarget">Target</label>
+              <input id="inpTarget" type="number" min="1" value="40">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field-group">
+              <label for="inpTrailTrigger">Trail Trigger</label>
+              <input id="inpTrailTrigger" type="number" min="0" value="15">
+            </div>
+            <div class="field-group">
+              <label for="inpTrailLock">Trail Lock</label>
+              <input id="inpTrailLock" type="number" min="0" value="10">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field-group">
+              <label for="inpLotSize">Lot Size</label>
+              <input id="inpLotSize" type="number" min="1" value="65">
+            </div>
+            <div class="field-group">
+              <label for="inpDelta">Delta</label>
+              <input id="inpDelta" type="number" min="0" step="0.1" value="0.5">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field-group">
+              <label for="simShortLen">Sim Short VMA</label>
+              <input id="simShortLen" type="number" min="1" value="9">
+            </div>
+            <div class="field-group">
+              <label for="simLongLen">Sim Long VMA</label>
+              <input id="simLongLen" type="number" min="2" value="21">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field-group">
+              <label for="inpMinQuality">Min Quality</label>
+              <input id="inpMinQuality" type="number" min="0" max="5" value="2">
+            </div>
+            <div class="field-group toggles">
+              <label><input id="inpSidewaysFilter" type="checkbox" checked> Skip Sideways</label>
+              <label><input id="inpConfirmCandle" type="checkbox" checked> Use Confirm Candle</label>
+            </div>
+          </div>
+          <button class="action-btn" id="simBtn" type="button">Run Simulation</button>
+        </div>
+
+        <section class="saved-trades">
+          <div class="panel-head compact">
+            <h3>Saved Trades</h3>
+            <span class="mono subtle" id="savedTradesMeta">Sync pending</span>
+          </div>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Type</th>
+                  <th>Exit</th>
+                  <th>P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody id="savedTradesTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/assets/index.js" defer></script>
+</body>
+</html>

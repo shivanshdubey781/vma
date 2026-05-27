@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: vma-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8012:8012"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: vma-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/vma.conf:/etc/nginx/conf.d/default.conf:ro

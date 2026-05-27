@@ -1,0 +1,1046 @@
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from dotenv import load_dotenv
+from datetime import datetime, date
+import base64
+import hashlib
+import hmac
+import json
+import numpy as np
+import os
+import re
+import socket
+import struct
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+app = Flask(__name__, static_folder=str(BASE_DIR / "static"), static_url_path="/static")
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
+CORS(app)
+
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+DB_NAME = os.getenv("MONGO_DB", "trading_bot_db").strip() or "trading_bot_db"
+VMA_RESULTS_COLLECTION = "vma_results"
+VMA_TRADES_COLLECTION = "vma_trades"
+VMA_RETENTION_SECONDS = 3 * 24 * 60 * 60
+COLLECTION_MAP = {
+    "1min": "OHLC",
+    "3min": "OHLC3",
+    "5min": "OHLC5",
+}
+TIME_FIELDS = ("timestamp_ist", "timestamp", "time", "datetime", "date")
+
+ANGEL_BASE_URL = "https://apiconnect.angelone.in"
+ANGEL_LOGIN_PATH = "/rest/auth/angelbroking/user/v1/loginByPassword"
+ANGEL_LTP_PATH = "/rest/secure/angelbroking/order/v1/getLtpData"
+ANGEL_INSTRUMENTS_URL = (
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+)
+
+
+def _totp_now(secret: str, step: int = 30, digits: int = 6) -> str:
+    normalized = "".join(secret.strip().split()).upper()
+    padding = "=" * (-len(normalized) % 8)
+    key = base64.b32decode(normalized + padding, casefold=True)
+    counter = int(time.time() // step)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % (10 ** digits)).zfill(digits)
+
+
+class AngelOneClient:
+    def __init__(self) -> None:
+        self.api_key = os.getenv("ANGEL_API_KEY", "").strip()
+        self.client_id = os.getenv("ANGEL_CLIENT_ID", "").strip()
+        self.mpin = os.getenv("ANGEL_MPIN", "").strip()
+        self.totp_secret = os.getenv("ANGEL_TOTP_SECRET", "").strip()
+        self._jwt_token: str | None = None
+        self._token_ts = 0.0
+        self._instruments_cache: list[dict] | None = None
+        self._instruments_loaded_at = 0.0
+
+    def is_configured(self) -> bool:
+        return all((self.api_key, self.client_id, self.mpin, self.totp_secret))
+
+    def _headers(self, authorized: bool = False) -> dict[str, str]:
+        local_ip = "127.0.0.1"
+        try:
+            local_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            pass
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-PrivateKey": self.api_key,
+            "X-UserType": "USER",
+            "X-SourceID": "WEB",
+            "X-ClientLocalIP": local_ip,
+            "X-ClientPublicIP": local_ip,
+            "X-MACAddress": ":".join(re.findall("..", f"{uuid.getnode():012x}"))
+            if "re" in globals()
+            else "00:00:00:00:00:00",
+        }
+        if authorized and self._jwt_token:
+            headers["Authorization"] = f"Bearer {self._jwt_token}"
+        return headers
+
+    def _post_json(self, path: str, payload: dict, *, authorized: bool = False) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ANGEL_BASE_URL + path,
+            data=body,
+            headers=self._headers(authorized=authorized),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Angel One HTTP {exc.code}: {message}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Angel One network error: {exc.reason}") from exc
+
+    def _ensure_session(self, force: bool = False) -> None:
+        if not self.is_configured():
+            raise RuntimeError("Angel One credentials are missing in .env")
+        if not force and self._jwt_token and (time.time() - self._token_ts) < 6 * 3600:
+            return
+
+        payload = {
+            "clientcode": self.client_id,
+            "password": self.mpin,
+            "totp": _totp_now(self.totp_secret),
+        }
+        response = self._post_json(ANGEL_LOGIN_PATH, payload, authorized=False)
+        data = response.get("data") or {}
+        jwt_token = data.get("jwtToken")
+        if not response.get("status") or not jwt_token:
+            raise RuntimeError(response.get("message") or response.get("errorcode") or "Angel One login failed")
+        self._jwt_token = jwt_token
+        self._token_ts = time.time()
+
+    def _should_retry_login(self, message: str) -> bool:
+        normalized = (message or "").lower()
+        retry_markers = (
+            "ag8001",
+            "ab1010",
+            "invalid jwt",
+            "invalid token",
+            "token expired",
+            "session expired",
+            "permission denied",
+            "access denied",
+            "unauthorized",
+            "forbidden",
+            "http 401",
+            "http 403",
+        )
+        return any(marker in normalized for marker in retry_markers)
+
+    def _load_instruments(self) -> list[dict]:
+        if self._instruments_cache and (time.time() - self._instruments_loaded_at) < 6 * 3600:
+            return self._instruments_cache
+
+        try:
+            with urllib.request.urlopen(ANGEL_INSTRUMENTS_URL, timeout=20) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Unable to download Angel One instrument master: {exc.reason}") from exc
+
+        def parse_expiry(value: str) -> date | None:
+            raw_value = (value or "").strip()
+            for fmt in ("%Y-%m-%d", "%d%b%Y", "%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(raw_value, fmt).date()
+                except ValueError:
+                    continue
+            return None
+
+        nifty_options = []
+        for row in raw:
+            if row.get("exch_seg") != "NFO":
+                continue
+            if row.get("name") != "NIFTY":
+                continue
+            if row.get("instrumenttype") not in {"OPTIDX", "CE", "PE"}:
+                continue
+            try:
+                strike = float(row.get("strike") or 0) / 100.0
+            except (TypeError, ValueError):
+                continue
+            option_type = row.get("symbol", "")[-2:]
+            if option_type not in {"CE", "PE"}:
+                option_type = row.get("instrumenttype", "")[-2:]
+            if option_type not in {"CE", "PE"}:
+                continue
+            nifty_options.append(
+                {
+                    "symboltoken": str(row.get("token")),
+                    "tradingsymbol": row.get("symbol"),
+                    "name": row.get("name"),
+                    "expiry": row.get("expiry"),
+                    "expiry_date": parse_expiry(row.get("expiry", "")),
+                    "strike": strike,
+                    "lot_size": int(float(row.get("lotsize") or 0) or 0),
+                    "option_type": option_type,
+                    "exch_seg": row.get("exch_seg"),
+                }
+            )
+
+        if not nifty_options:
+            raise RuntimeError("No NIFTY option contracts found in Angel One instrument master")
+
+        self._instruments_cache = nifty_options
+        self._instruments_loaded_at = time.time()
+        return nifty_options
+
+    def resolve_nifty_option(self, side: str, spot_price: float) -> dict:
+        contracts = self._load_instruments()
+        side = side.upper()
+        if side not in {"CE", "PE"}:
+            raise RuntimeError(f"Unsupported option side: {side}")
+
+        today = date.today()
+        base_strike = round(spot_price / 50.0) * 50.0
+        strike = base_strike - 50.0 if side == "CE" else base_strike + 50.0
+        candidates = [
+            c for c in contracts
+            if c["option_type"] == side and c["strike"] == strike and c["expiry_date"] and c["expiry_date"] >= today
+        ]
+        if not candidates:
+            raise RuntimeError(f"No {side} contract found for NIFTY strike {strike:.0f}")
+        candidates.sort(key=lambda c: (c["expiry_date"], c["tradingsymbol"]))
+        return candidates[0]
+
+    def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
+        payload = {
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "symboltoken": str(symboltoken),
+        }
+        last_error = "Angel One LTP request failed"
+
+        for attempt in range(2):
+            try:
+                self._ensure_session(force=attempt > 0)
+                response = self._post_json(ANGEL_LTP_PATH, payload, authorized=True)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                if attempt == 0 and self._should_retry_login(last_error):
+                    continue
+                raise
+
+            if response.get("status"):
+                data = response.get("data") or {}
+                ltp = data.get("ltp")
+                if ltp in (None, ""):
+                    raise RuntimeError("Angel One returned no LTP for the selected instrument")
+                return float(ltp)
+
+            last_error = response.get("message") or response.get("errorcode") or last_error
+            if attempt == 0 and self._should_retry_login(last_error):
+                continue
+            raise RuntimeError(last_error)
+
+        raise RuntimeError(last_error)
+
+    def get_nifty_option_ltp(self, side: str, spot_price: float) -> dict:
+        contract = self.resolve_nifty_option(side, spot_price)
+        ltp = self.get_ltp("NFO", contract["tradingsymbol"], contract["symboltoken"])
+        contract_payload = {k: v for k, v in contract.items() if k != "expiry_date"}
+        return {
+            "exchange": "NFO",
+            "ltp": round(ltp, 2),
+            **contract_payload,
+        }
+
+
+angel_client = AngelOneClient()
+_mongo_housekeeping_ready = False
+
+
+def get_db():
+    if not MONGO_URI:
+        raise RuntimeError("MONGO_URI is missing in the environment")
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+    return client[DB_NAME]
+
+
+def ensure_vma_housekeeping():
+    global _mongo_housekeeping_ready
+    if _mongo_housekeeping_ready:
+        return
+
+    db = get_db()
+    db[VMA_RESULTS_COLLECTION].create_index(
+        [("expires_at", ASCENDING)],
+        expireAfterSeconds=0,
+        name="vma_results_ttl",
+    )
+    db[VMA_TRADES_COLLECTION].create_index(
+        [("source_result_id", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="vma_trades_source_result_id",
+    )
+    db[VMA_TRADES_COLLECTION].create_index(
+        [("saved_at", ASCENDING)],
+        name="vma_trades_saved_at",
+    )
+    db[VMA_TRADES_COLLECTION].create_index(
+        [("trade_key", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="vma_trades_trade_key",
+    )
+    _mongo_housekeeping_ready = True
+
+
+def archive_expired_vma_results():
+    ensure_vma_housekeeping()
+    db = get_db()
+    cutoff = datetime.utcnow()
+    cursor = db[VMA_RESULTS_COLLECTION].find({"expires_at": {"$lte": cutoff}})
+    for document in cursor:
+        source_id = str(document["_id"])
+        archive_doc = {k: v for k, v in document.items() if k != "_id"}
+        archive_doc["source_result_id"] = source_id
+        archive_doc["archived_at"] = cutoff
+        db[VMA_TRADES_COLLECTION].replace_one(
+            {"source_result_id": source_id},
+            archive_doc,
+            upsert=True,
+        )
+        db[VMA_RESULTS_COLLECTION].delete_one({"_id": document["_id"]})
+
+
+def save_vma_result_snapshot(payload: dict):
+    ensure_vma_housekeeping()
+    archive_expired_vma_results()
+    db = get_db()
+    saved_at = datetime.utcnow()
+    expires_at = datetime.utcfromtimestamp(saved_at.timestamp() + VMA_RETENTION_SECONDS)
+    document = {
+        **payload,
+        "saved_at": saved_at,
+        "expires_at": expires_at,
+    }
+    db[VMA_RESULTS_COLLECTION].insert_one(document)
+
+
+def save_vma_trades(payload: dict):
+    ensure_vma_housekeeping()
+    archive_expired_vma_results()
+    db = get_db()
+    saved_at = datetime.utcnow()
+    trades = payload.get("trades") or []
+    inserted = 0
+    updated = 0
+    meta = payload.get("meta") or {}
+    for trade in trades:
+        trade_key = build_trade_key(trade, meta)
+        document = {
+            **trade,
+            "trade_key": trade_key,
+            "saved_at": saved_at,
+            "source": "simulation_ui",
+            "meta": meta,
+        }
+        result = db[VMA_TRADES_COLLECTION].replace_one(
+            {"trade_key": trade_key},
+            document,
+            upsert=True,
+        )
+        if result.upserted_id is not None:
+            inserted += 1
+        elif result.modified_count:
+            updated += 1
+    return {"inserted": inserted, "updated": updated, "total": len(trades)}
+
+
+def build_trade_key(trade: dict, meta: dict) -> str:
+    raw = json.dumps(
+        {
+            "started_at": meta.get("started_at"),
+            "timeframe": meta.get("timeframe"),
+            "params": meta.get("params"),
+            "trade": {
+                "type": trade.get("type"),
+                "entryTs": trade.get("entryTs"),
+                "entryPrice": trade.get("entryPrice"),
+                "exitTs": trade.get("exitTs"),
+                "exitPrice": trade.get("exitPrice"),
+                "reason": trade.get("reason"),
+                "instrument": trade.get("instrument"),
+                "contract": trade.get("contract"),
+            },
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def fetch_saved_vma_trades(limit: int = 100) -> list[dict]:
+    ensure_vma_housekeeping()
+    archive_expired_vma_results()
+    db = get_db()
+    docs = list(
+        db[VMA_TRADES_COLLECTION]
+        .find({}, {"_id": 0})
+        .sort([("saved_at", DESCENDING)])
+        .limit(limit)
+    )
+    docs.reverse()
+    return docs
+
+
+def _pick_time_field(document: dict) -> str | None:
+    key_map = {key.lower(): key for key in document}
+    for field in TIME_FIELDS:
+        if field in key_map:
+            return key_map[field]
+    return None
+
+
+def fetch_closes(timeframe: str, limit: int = 500):
+    col_name = COLLECTION_MAP.get(timeframe)
+    if not col_name:
+        raise ValueError(f"Unknown timeframe: {timeframe}")
+    db = get_db()
+    col = db[col_name]
+
+    sample = col.find_one()
+    ts_field = _pick_time_field(sample) if sample else None
+
+    sort_desc = [(ts_field, -1)] if ts_field else [("_id", -1)]
+    docs = list(col.find({}, {"_id": 0}).sort(sort_desc).limit(limit))
+    docs.reverse()
+
+    rows_by_timestamp = {}
+    for d in docs:
+        norm = {k.lower(): v for k, v in d.items()}
+        close = float(norm.get("close", 0) or 0)
+        open_ = float(norm.get("open", 0) or 0)
+        high  = float(norm.get("high", 0) or 0)
+        low   = float(norm.get("low", 0) or 0)
+
+        ts_val = None
+        for field in TIME_FIELDS:
+            if norm.get(field):
+                ts_val = str(norm[field])
+                break
+
+        row = {
+            "timestamp": ts_val,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+
+        dedupe_key = ts_val or f"row-{len(rows_by_timestamp)}"
+        rows_by_timestamp[dedupe_key] = row
+
+    return list(rows_by_timestamp.values())
+
+
+# ─────────────────────────────────────────────────────────────
+# Single VMA (LazyBear)
+# ─────────────────────────────────────────────────────────────
+
+def compute_vma(rows, length: int = 6):
+    if length <= 0:
+        raise ValueError("length must be greater than 0")
+
+    k = 1.0 / length
+    pdmS = mdmS = pdiS = mdiS = iS_val = 0.0
+    vma = None
+    iS_arr = []
+    results = []
+    prev_vma_raw = None
+
+    for i, r in enumerate(rows):
+        src = r["close"]
+        prev = rows[i - 1]["close"] if i > 0 else src
+
+        pdm = max(src - prev, 0.0)
+        mdm = max(prev - src, 0.0)
+
+        # Match TradingView's recursive smoothing with nz(previous) semantics.
+        pdmS = (1 - k) * pdmS + k * pdm
+        mdmS = (1 - k) * mdmS + k * mdm
+
+        s = pdmS + mdmS
+        pdi = (pdmS / s) if s else 0.0
+        mdi = (mdmS / s) if s else 0.0
+
+        pdiS = (1 - k) * pdiS + k * pdi
+        mdiS = (1 - k) * mdiS + k * mdi
+
+        d = abs(pdiS - mdiS)
+        s1 = pdiS + mdiS
+        ratio = (d / s1) if s1 else 0.0
+        iS_val = (1 - k) * iS_val + k * ratio
+        iS_arr.append(iS_val)
+
+        win = iS_arr[max(0, i - length + 1): i + 1]
+        hhv, llv = max(win), min(win)
+        rng = hhv - llv
+        vI = ((iS_val - llv) / rng) if rng else 0.0
+
+        # Seed from the first price so the line starts on-chart instead of at 0.
+        if vma is None:
+            vma = src
+        else:
+            vma = (1 - k * vI) * vma + k * vI * src
+
+        prev_vma = prev_vma_raw if prev_vma_raw is not None else vma
+        if vma > prev_vma:
+            trend = "UP"
+        elif vma < prev_vma:
+            trend = "DOWN"
+        else:
+            trend = "FLAT"
+
+        prev_vma_raw = vma
+
+        results.append({
+            "timestamp": r["timestamp"],
+            "open":  round(r["open"],  4),
+            "high":  round(r["high"],  4),
+            "low":   round(r["low"],   4),
+            "close": round(src,        4),
+            "vma":   round(vma,        4),
+            "trend": trend,
+        })
+
+    return results
+
+
+@app.route("/api/vma")
+def api_vma():
+    timeframe = request.args.get("tf", "1min")
+    length    = int(request.args.get("length", 6))
+    try:
+        rows    = fetch_closes(timeframe, limit=2000)
+        data    = compute_vma(rows, length)
+        last    = data[-1]  if data else {}
+        prev    = data[-2]  if len(data) > 1 else last
+        delta   = round(last.get("vma", 0) - prev.get("vma", 0), 4) if data else 0
+        response = {
+            "ok":         True,
+            "timeframe":  timeframe,
+            "length":     length,
+            "total_bars": len(data),
+            "current": {
+                "timestamp": last.get("timestamp"),
+                "close":     last.get("close"),
+                "vma":       last.get("vma"),
+                "prev_vma":  prev.get("vma"),
+                "delta":     delta,
+                "trend":     last.get("trend"),
+            },
+            "history": data[-50:],
+        }
+        save_vma_result_snapshot({
+            "kind": "single_vma",
+            "timeframe": timeframe,
+            "length": length,
+            "total_bars": len(data),
+            "current": response["current"],
+        })
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# Dual-VMA crossover helpers
+# ─────────────────────────────────────────────────────────────
+
+def _atr_series(rows: list[dict], period: int = 14) -> list[float]:
+    """Wilder's ATR — same as TradingView's built-in ATR()"""
+    trs, atrs = [], []
+    prev_close = None
+    atr = 0.0
+    for i, r in enumerate(rows):
+        hi, lo, cl = r["high"], r["low"], r["close"]
+        if prev_close is None:
+            tr = hi - lo
+        else:
+            tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        trs.append(tr)
+        if len(trs) < period:
+            atr = sum(trs) / len(trs)
+        else:
+            if len(trs) == period:
+                atr = sum(trs) / period
+            else:
+                atr = (atr * (period - 1) + tr) / period
+        atrs.append(round(atr, 4))
+        prev_close = cl
+    return atrs
+
+
+def _rsi_series(rows: list[dict], period: int = 14) -> list[float]:
+    """Wilder RSI"""
+    closes = [r["close"] for r in rows]
+    gains, losses = [], []
+    rsis = []
+    avg_gain = avg_loss = 0.0
+    for i, cl in enumerate(closes):
+        if i == 0:
+            rsis.append(50.0)
+            continue
+        chg = cl - closes[i - 1]
+        gain = max(chg, 0.0)
+        loss = max(-chg, 0.0)
+        if i < period:
+            gains.append(gain)
+            losses.append(loss)
+            avg_gain = sum(gains) / len(gains)
+            avg_loss = sum(losses) / len(losses)
+        else:
+            if i == period:
+                gains.append(gain)
+                losses.append(loss)
+                avg_gain = sum(gains) / period
+                avg_loss = sum(losses) / period
+            else:
+                avg_gain = (avg_gain * (period - 1) + gain) / period
+                avg_loss = (avg_loss * (period - 1) + loss) / period
+        if avg_gain == 0.0 and avg_loss == 0.0:
+            rsi_val = 50.0
+        elif avg_loss == 0.0:
+            rsi_val = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_val = round(100.0 - 100.0 / (1.0 + rs), 2)
+        rsis.append(rsi_val)
+    return rsis
+
+
+def _vma_series(rows: list[dict], length: int) -> list[float]:
+    """Return just the VMA float values for each row (same algorithm as compute_vma)."""
+    if length <= 0:
+        raise ValueError("length must be > 0")
+    k = 1.0 / length
+    pdmS = mdmS = pdiS = mdiS = iS_val = 0.0
+    vma = None
+    iS_arr: list[float] = []
+    out: list[float] = []
+
+    for i, r in enumerate(rows):
+        src  = r["close"]
+        prev = rows[i - 1]["close"] if i > 0 else src
+
+        pdm  = max(src - prev, 0.0)
+        mdm  = max(prev - src, 0.0)
+        pdmS = (1 - k) * pdmS + k * pdm
+        mdmS = (1 - k) * mdmS + k * mdm
+
+        s   = pdmS + mdmS
+        pdi = (pdmS / s) if s else 0.0
+        mdi = (mdmS / s) if s else 0.0
+
+        pdiS = (1 - k) * pdiS + k * pdi
+        mdiS = (1 - k) * mdiS + k * mdi
+
+        d     = abs(pdiS - mdiS)
+        s1    = pdiS + mdiS
+        ratio = (d / s1) if s1 else 0.0
+        iS_val = (1 - k) * iS_val + k * ratio
+        iS_arr.append(iS_val)
+
+        win = iS_arr[max(0, i - length + 1): i + 1]
+        hhv, llv = max(win), min(win)
+        rng = hhv - llv
+        vI  = ((iS_val - llv) / rng) if rng else 0.0
+
+        vma = src if vma is None else (1 - k * vI) * vma + k * vI * src
+        out.append(round(vma, 4))
+
+    return out
+
+
+def compute_dual_vma(rows: list[dict], short_len: int = 9, long_len: int = 21) -> list[dict]:
+    """
+    Compute Short-VMA and Long-VMA series for the same candle list.
+    Tag each bar with a crossover signal and professional filters.
+    """
+    short_vals = _vma_series(rows, short_len)
+    long_vals  = _vma_series(rows, long_len)
+    atr_vals   = _atr_series(rows, 14)
+    rsi_vals   = _rsi_series(rows, 14)
+
+    results = []
+    for i, r in enumerate(rows):
+        sv = short_vals[i]
+        lv = long_vals[i]
+        atr = atr_vals[i]
+        rsi = rsi_vals[i]
+
+        # crossover detection
+        if i == 0:
+            signal = "NONE"
+        else:
+            prev_sv = short_vals[i - 1]
+            prev_lv = long_vals[i - 1]
+            if prev_sv <= prev_lv and sv > lv:
+                signal = "CE"   # bullish crossover → buy CALL
+            elif prev_sv >= prev_lv and sv < lv:
+                signal = "PE"   # bearish crossover → buy PUT
+            else:
+                signal = "NONE"
+
+        # slopes (3-bar lookback)
+        short_slope = round(sv - short_vals[i - 3], 4) if i >= 3 else 0.0
+        long_slope  = round(lv - long_vals[i - 3], 4) if i >= 3 else 0.0
+
+        # vma spread & sideways flag
+        vma_spread = round(abs(sv - lv), 4)
+        is_sideways = bool(vma_spread < round(atr * 0.3, 4))
+
+        # upper and lower bands
+        upper_band = round(sv + atr * 1.5, 4)
+        lower_band = round(sv - atr * 1.5, 4)
+
+        # short-vma slope for display colouring
+        if i == 0:
+            svma_trend = "FLAT"
+        elif sv > short_vals[i - 1]:
+            svma_trend = "UP"
+        elif sv < short_vals[i - 1]:
+            svma_trend = "DOWN"
+        else:
+            svma_trend = "FLAT"
+
+        # relative position of short vs long
+        position = "ABOVE" if sv > lv else ("BELOW" if sv < lv else "CROSS")
+
+        # confirm_signal is signal from the previous bar
+        confirm_signal = results[i - 1]["signal"] if i > 0 else "NONE"
+
+        # Quality score (0-5)
+        quality = 0
+        if confirm_signal != "NONE":
+            quality += 1  # Crossover confirmed
+
+            # Short slope in signal direction
+            if confirm_signal == "CE" and short_slope > 0:
+                quality += 1
+            elif confirm_signal == "PE" and short_slope < 0:
+                quality += 1
+
+            # Long slope in signal direction
+            if confirm_signal == "CE" and long_slope > 0:
+                quality += 1
+            elif confirm_signal == "PE" and long_slope < 0:
+                quality += 1
+
+            # VMA spread >= ATR * 0.5 (lines separating)
+            if vma_spread >= round(atr * 0.5, 4):
+                quality += 1
+
+            # RSI confirms (CE: RSI > 55, PE: RSI < 45)
+            if confirm_signal == "CE" and rsi > 55:
+                quality += 1
+            elif confirm_signal == "PE" and rsi < 45:
+                quality += 1
+
+        results.append({
+            "timestamp":      r["timestamp"],
+            "open":           round(r["open"],  4),
+            "high":           round(r["high"],  4),
+            "low":            round(r["low"],   4),
+            "close":          round(r["close"], 4),
+            "short_vma":      sv,
+            "long_vma":       lv,
+            "signal":         signal,      # CE / PE / NONE
+            "confirm_signal": confirm_signal,
+            "svma_trend":     svma_trend,  # UP / DOWN / FLAT
+            "position":       position,    # ABOVE / BELOW / CROSS
+            "atr":            atr,
+            "rsi":            rsi,
+            "upper_band":     upper_band,
+            "lower_band":     lower_band,
+            "is_sideways":    is_sideways,
+            "short_slope":    short_slope,
+            "long_slope":     long_slope,
+            "quality":        quality,
+        })
+
+    return results
+
+
+@app.route("/api/dual-vma")
+def api_dual_vma():
+    """
+    Dual VMA crossover endpoint.
+
+    Query params
+    ────────────
+    tf        : '1min' | '3min' | '5min'   (default '1min')
+    short_len : int  (default 5)
+    long_len  : int  (default 20)
+    limit     : int  bars to fetch (default 2000)
+    """
+    timeframe = request.args.get("tf",        "5min")
+    short_len = int(request.args.get("short_len", 9))
+    long_len  = int(request.args.get("long_len",  21))
+    limit     = int(request.args.get("limit",    2000))
+
+    if short_len <= 0 or long_len <= 0:
+        return jsonify({"ok": False, "error": "lengths must be > 0"}), 400
+    if short_len >= long_len:
+        return jsonify({"ok": False, "error": "short_len must be < long_len"}), 400
+
+    try:
+        rows = fetch_closes(timeframe, limit=limit)
+        data = compute_dual_vma(rows, short_len, long_len)
+
+        last = data[-1] if data else {}
+        prev = data[-2] if len(data) > 1 else last
+
+        # count crossover signals in full history
+        ce_signals = sum(1 for d in data if d["signal"] == "CE")
+        pe_signals = sum(1 for d in data if d["signal"] == "PE")
+
+        response = {
+            "ok":         True,
+            "timeframe":  timeframe,
+            "short_len":  short_len,
+            "long_len":   long_len,
+            "total_bars": len(data),
+            "ce_signals": ce_signals,
+            "pe_signals": pe_signals,
+            "current": {
+                "timestamp":      last.get("timestamp"),
+                "close":          last.get("close"),
+                "short_vma":      last.get("short_vma"),
+                "long_vma":       last.get("long_vma"),
+                "signal":         last.get("signal"),
+                "confirm_signal": last.get("confirm_signal"),
+                "svma_trend":     last.get("svma_trend"),
+                "position":       last.get("position"),
+                "prev_short":     prev.get("short_vma"),
+                "prev_long":      prev.get("long_vma"),
+                "atr":            last.get("atr"),
+                "rsi":            last.get("rsi"),
+                "upper_band":     last.get("upper_band"),
+                "lower_band":     last.get("lower_band"),
+                "is_sideways":    last.get("is_sideways"),
+                "quality":        last.get("quality"),
+            },
+            "history": data,     # full history — JS sim engine needs all bars
+        }
+        save_vma_result_snapshot({
+            "kind": "dual_vma",
+            "timeframe": timeframe,
+            "short_len": short_len,
+            "long_len": long_len,
+            "total_bars": len(data),
+            "ce_signals": ce_signals,
+            "pe_signals": pe_signals,
+            "current": response["current"],
+        })
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/vma-trades", methods=["GET", "POST"])
+def api_vma_trades():
+    if request.method == "GET":
+        try:
+            limit = max(1, min(int(request.args.get("limit", "100")), 500))
+        except ValueError:
+            return jsonify({"ok": False, "error": "limit must be a number"}), 400
+
+        try:
+            trades = fetch_saved_vma_trades(limit=limit)
+            return jsonify({"ok": True, "trades": trades, "count": len(trades)})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    payload = request.get_json(silent=True) or {}
+    trades = payload.get("trades") or []
+    if not isinstance(trades, list):
+        return jsonify({"ok": False, "error": "trades must be a list"}), 400
+
+    try:
+        summary = save_vma_trades(payload)
+        return jsonify({"ok": True, **summary})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/angel/option-ltp")
+def api_angel_option_ltp():
+    side = request.args.get("side", "CE").upper()
+    try:
+        spot = float(request.args.get("spot", "0"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "spot must be a number"}), 400
+
+    if side not in {"CE", "PE"}:
+        return jsonify({"ok": False, "error": "side must be CE or PE"}), 400
+    if spot <= 0:
+        return jsonify({"ok": False, "error": "spot must be greater than 0"}), 400
+
+    try:
+        data = angel_client.get_nifty_option_ltp(side, spot)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/angel/ltp")
+def api_angel_ltp():
+    exchange = request.args.get("exchange", "").strip().upper()
+    tradingsymbol = request.args.get("tradingsymbol", "").strip().upper()
+    symboltoken = request.args.get("symboltoken", "").strip()
+
+    if not exchange or not tradingsymbol or not symboltoken:
+        return jsonify({"ok": False, "error": "exchange, tradingsymbol and symboltoken are required"}), 400
+
+    try:
+        ltp = angel_client.get_ltp(exchange, tradingsymbol, symboltoken)
+        return jsonify({
+            "ok": True,
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "symboltoken": symboltoken,
+            "ltp": round(ltp, 2),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/")
+def index():
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "env": os.getenv("ENV", "dev"),
+            "mongo_configured": bool(MONGO_URI),
+            "angel_configured": angel_client.is_configured(),
+        }
+    )
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(
+        {
+            "status": "ok",
+            "env": os.getenv("ENV", "dev"),
+            "service": "vma-dashboard",
+        }
+    )
+
+
+@app.route("/assets/<path:filename>")
+def assets(filename: str):
+    return send_from_directory(BASE_DIR, filename)
+
+
+@app.route("/service-worker.js")
+def service_worker():
+    response = send_from_directory(BASE_DIR, "service-worker.js")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.after_request
+def apply_cache_headers(response):
+    if request.path.startswith("/api/") or request.path == "/":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    elif request.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+HOST = os.getenv("API_HOST", "127.0.0.1")
+PORT = int(os.getenv("API_PORT", "5011"))
+URL  = f"http://{HOST}:{PORT}"
+
+
+def _wait_and_open(url: str, timeout: int = 10):
+    """Poll until the server is up, then open the browser."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            break
+        except Exception:
+            time.sleep(0.2)
+    webbrowser.open(url)
+
+
+def open_frontend():
+    """
+    Open the VMA dashboard in the default browser.
+
+    - If the Flask server is already running on port 5011, just opens the URL.
+    - If the server is NOT running, starts it in a background thread first,
+      waits until it is ready, then opens the browser.
+
+    Usage:
+        from app import open_frontend
+        open_frontend()
+    """
+    already_up = False
+    try:
+        urllib.request.urlopen(URL, timeout=1)
+        already_up = True
+    except Exception:
+        pass
+
+    if already_up:
+        print(f"Server already running -> opening {URL}")
+        webbrowser.open(URL)
+    else:
+        print(f"Starting VMA server on {URL} ...")
+        server_thread = threading.Thread(
+            target=lambda: app.run(host=HOST, port=PORT, debug=False, use_reloader=False),
+            daemon=True,
+        )
+        server_thread.start()
+        _wait_and_open(URL)
+        print(f"Dashboard opened in browser -> {URL}")
+        server_thread.join()
+
+
+def run_server():
+    """Start the Flask server in the foreground (blocking). Used by __main__."""
+    os.makedirs(BASE_DIR / "static", exist_ok=True)
+    print(f"VMA Flask server -> {URL}")
+    print("Press Ctrl+C to stop.\n")
+    app.run(host=HOST, port=PORT, debug=True)
+
+
+if __name__ == "__main__":
+    os.makedirs(BASE_DIR / "static", exist_ok=True)
+    open_frontend()

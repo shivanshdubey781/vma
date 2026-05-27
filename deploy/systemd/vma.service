@@ -1,0 +1,14 @@
+[Unit]
+Description=VMA Institutional Algo API
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/vma
+EnvironmentFile=/opt/vma/.env
+ExecStart=/opt/vma/.venv/bin/gunicorn --bind 0.0.0.0:8012 --workers 2 --threads 4 main:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
