@@ -1,9 +1,30 @@
-﻿'use strict';
+'use strict';
 
-const STORAGE_KEY = 'vma_dashboard_state_v2';
-const ASSET_CACHE_VERSION = '2026-05-27-1';
+const STORAGE_KEY = 'vma_dashboard_state_v3';
+const INDIA_TIMEZONE = 'Asia/Kolkata';
+const MARKET_WINDOW = Object.freeze({
+  startMinutes: 9 * 60 + 16,
+  endMinutes: 15 * 60 + 30,
+});
+const DEFAULTS = Object.freeze({
+  timeframe: '5min',
+  shortLen: '5',
+  longLen: '9',
+  refreshInterval: '10000',
+  instrument: 'options',
+  sl: '40',
+  target: '60',
+  trailTrigger: '25',
+  trailLock: '15',
+  lotSize: '65',
+  delta: '0.5',
+  minQuality: '2',
+  sidewaysFilter: false,
+  confirmCandle: false,
+});
+
 const state = {
-  tf: '5min',
+  tf: DEFAULTS.timeframe,
   dualData: null,
   simActive: false,
   simStartTime: null,
@@ -13,7 +34,14 @@ const state = {
   simLastTs: null,
   lastSavedTradeCount: 0,
   pollTimer: null,
+  clockTimer: null,
   savedTrades: [],
+  manualSessionPause: false,
+  historyPage: 1,
+  historyPageSize: 15,
+  tradesPage: 1,
+  tradesPageSize: 10,
+  lastTradeType: null,
 };
 
 const els = {};
@@ -25,20 +53,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   restoreState();
   syncFormToState();
   renderAll();
+  startMarketClock();
   await Promise.all([loadDashboard(), loadSavedTrades()]);
-  if (state.simActive) {
-    startPolling();
-  }
+  syncMarketSession(true);
 });
 
 function bindElements() {
   [
     'liveBadge', 'statusBox', 'calcBtn', 'timeframe', 'shortLen', 'longLen', 'refreshInterval',
     'heroSignal', 'heroTimestamp', 'heroVma', 'heroPosition', 'heroClose', 'heroRsi', 'heroQuality', 'heroSideways',
-    'historyMeta', 'historyTable', 'resultMeta', 'statTrades', 'statWinRate', 'statPnl', 'statBest', 'statWorst', 'statRR',
-    'activeTradeGrid', 'simBtn', 'resetBtn', 'inpInstrument', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock',
+    'historyMeta', 'historyTable', 'resultMeta', 'resultMetaInline', 'statTrades', 'statWinRate', 'statPnl', 'statBest', 'statWorst', 'statRR',
+    'activeTradeCard', 'activeTradeGrid', 'simBtn', 'resetBtn', 'inpInstrument', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock',
     'inpLotSize', 'inpDelta', 'simShortLen', 'simLongLen', 'inpMinQuality', 'inpSidewaysFilter', 'inpConfirmCandle',
-    'tradesTable', 'savedTradesTable', 'savedTradesMeta'
+    'savedTradesTable', 'savedTradesMeta', 'marketClock', 'sessionStatus', 'sessionWindow', 'closeActiveTradeBtn',
+    'historyPagination', 'historyPrevBtn', 'historyNextBtn', 'historyPageInfo',
+    'tradesPagination', 'tradesPrevBtn', 'tradesNextBtn', 'tradesPageInfo'
   ].forEach((id) => {
     els[id] = document.getElementById(id);
   });
@@ -46,13 +75,43 @@ function bindElements() {
 
 function bindEvents() {
   els.calcBtn.addEventListener('click', () => loadDashboard(true));
-  els.simBtn.addEventListener('click', () => state.simActive ? stopSimulation() : startSimulation());
+  els.simBtn.addEventListener('click', () => state.simActive ? stopSimulation({ manual: true, reason: 'MANUAL' }) : startSimulation({ manual: true }));
   els.resetBtn.addEventListener('click', resetSimulationForm);
   els.inpInstrument.addEventListener('change', updateInstrumentMode);
   ['shortLen', 'simShortLen'].forEach((id) => els[id].addEventListener('input', syncLengthFields));
   ['longLen', 'simLongLen'].forEach((id) => els[id].addEventListener('input', syncLengthFields));
   ['timeframe', 'refreshInterval', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock', 'inpLotSize', 'inpDelta', 'inpMinQuality', 'inpSidewaysFilter', 'inpConfirmCandle'].forEach((id) => {
     els[id].addEventListener('change', persistState);
+  });
+  els.closeActiveTradeBtn.addEventListener('click', closeActivePositionManually);
+  els.historyPrevBtn.addEventListener('click', () => {
+    if (state.historyPage > 1) {
+      state.historyPage--;
+      renderDashboard();
+    }
+  });
+  els.historyNextBtn.addEventListener('click', () => {
+    const allHistory = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
+    const totalPages = Math.ceil(allHistory.length / state.historyPageSize);
+    if (state.historyPage < totalPages) {
+      state.historyPage++;
+      renderDashboard();
+    }
+  });
+  els.tradesPrevBtn.addEventListener('click', () => {
+    if (state.tradesPage > 1) {
+      state.tradesPage--;
+      renderSavedTrades();
+    }
+  });
+  els.tradesNextBtn.addEventListener('click', () => {
+    const allRows = Array.isArray(state.savedTrades) ? state.savedTrades : [];
+    const completedTrades = allRows.filter((t) => t.entryPrice != null && t.exitPrice != null && t.type);
+    const totalPages = Math.ceil(completedTrades.length / state.tradesPageSize);
+    if (state.tradesPage < totalPages) {
+      state.tradesPage++;
+      renderSavedTrades();
+    }
   });
 }
 
@@ -96,9 +155,10 @@ async function loadDashboard(showMessage = false) {
   }
 }
 
-function startSimulation() {
+function startSimulation(options = {}) {
   const simParams = readSimulationParams();
-  if (!simParams) return;
+  if (!simParams) return false;
+  state.manualSessionPause = false;
   state.simActive = true;
   state.simStartTime = new Date(Date.now() - 90 * 1000).toISOString();
   state.simParams = simParams;
@@ -107,19 +167,32 @@ function startSimulation() {
   state.simLastTs = null;
   state.lastSavedTradeCount = 0;
   renderSimulation();
-  setStatus('Simulation started. Watching fresh crossover bars.', false, true);
+  setStatus(options.manual ? 'Simulation started manually.' : 'Simulation auto-started for the live market session.', false, true);
   persistState();
   startPolling();
+  return true;
 }
 
-function stopSimulation() {
+function stopSimulation(options = {}) {
   state.simActive = false;
+  if (options.manual && isMarketOpen()) {
+    state.manualSessionPause = true;
+  }
+  if (!options.manual) {
+    state.manualSessionPause = false;
+  }
   stopPolling();
-  closeOpenPosition('EOD');
-  persistCompletedTrades();
+  closeOpenPosition(options.reason || 'EOD');
+  persistCompletedTrades().catch((error) => setStatus('Trade persistence failed: ' + error.message, true));
   renderSimulation();
-  setStatus('Simulation stopped. Trades persisted and UI state saved locally.', false, true);
+  setStatus(resolveStopMessage(options), false, true);
   persistState();
+}
+
+function resolveStopMessage(options) {
+  if (options.reason === 'MANUAL') return 'Simulation paused manually. Auto-start will resume on the next market session.';
+  if (options.reason === 'EOD') return 'Market session closed at 3:30 PM IST. Open trades were closed and saved.';
+  return 'Simulation stopped. Trades persisted and UI state saved locally.';
 }
 
 function startPolling() {
@@ -166,6 +239,9 @@ async function pollAndProcess() {
     await persistCompletedTrades();
     persistState();
   } catch (error) {
+    if (error.name === 'AbortError' || error.message.includes('aborted') || error.message.includes('Aborted')) {
+      return;
+    }
     setStatus('Live polling error: ' + error.message, true);
   }
 }
@@ -178,6 +254,9 @@ async function processBar(bar) {
 
   const signal = state.simParams.confirmCandle ? bar.confirm_signal : bar.signal;
   if (!['CE', 'PE'].includes(signal)) return;
+
+  // Alternation Logic: strictly alternate CE and PE trades
+  if (state.lastTradeType && state.lastTradeType === signal) return;
   if (state.simParams.sidewaysFilter && bar.is_sideways) return;
   if ((bar.quality || 0) < state.simParams.minQuality) return;
 
@@ -215,6 +294,7 @@ async function processBar(bar) {
       lastSpot: entry,
     };
   }
+  persistState();
 }
 
 async function updateOpenPosition(bar) {
@@ -256,10 +336,31 @@ function closeOpenPosition(reason) {
   completeTrade(pos.lastPrice || pos.entry, latestTimestamp(), reason);
 }
 
+async function closeActivePositionManually() {
+  const pos = state.simPosition;
+  if (!pos) return;
+  if (confirm('Are you sure you want to square off this active position manually?')) {
+    if (!state.simParams) {
+      state.simParams = {
+        lotSize: parseInt(els.inpLotSize.value, 10) || 65,
+        delta: parseFloat(els.inpDelta.value) || 0.5,
+        instrument: els.inpInstrument.value || 'options',
+      };
+    }
+    completeTrade(pos.lastPrice || pos.entry, latestTimestamp(), 'MANUAL');
+    renderAll();
+    await persistCompletedTrades();
+    persistState();
+    setStatus('Position squared off manually.', false, true);
+  }
+}
+
 function completeTrade(exitPrice, exitTs, reason) {
   const trade = buildTrade(state.simPosition, exitPrice, exitTs, reason);
   state.simTrades.push(trade);
+  state.lastTradeType = trade.type;
   state.simPosition = null;
+  persistState();
 }
 
 function buildTrade(position, exitPrice, exitTs, reason) {
@@ -272,6 +373,10 @@ function buildTrade(position, exitPrice, exitTs, reason) {
     points = (exitPrice - position.entry) * direction * state.simParams.delta;
   }
 
+  const trailSL = (position.curSL != null && round(position.curSL) !== round(position.initSL))
+    ? round(position.curSL)
+    : null;
+
   return {
     type: position.type,
     instrument: position.instrument,
@@ -282,6 +387,7 @@ function buildTrade(position, exitPrice, exitTs, reason) {
     exitPrice: round(exitPrice),
     sl: round(position.initSL),
     tgt: round(position.tgt),
+    trailSL: trailSL,
     lotSize: lotSize,
     pts: round(points),
     grossPnl: round(points * lotSize),
@@ -325,11 +431,17 @@ async function persistCompletedTrades() {
 
 async function loadSavedTrades() {
   try {
-    const response = await fetch('/api/vma-trades?limit=25', { cache: 'no-store' });
+    const response = await fetch('/api/vma-trades?limit=50', { cache: 'no-store' });
     const json = await response.json();
     if (!json.ok) throw new Error(json.error || 'Unable to fetch saved trades');
     state.savedTrades = json.trades || [];
-    els.savedTradesMeta.textContent = (json.count || 0) + ' trades in MongoDB';
+    els.savedTradesMeta.textContent = (json.count || 0) + ' trades saved';
+    if (state.savedTrades.length > 0) {
+      const validCompleted = state.savedTrades.filter(t => t.entryPrice != null && t.exitPrice != null && t.type);
+      if (validCompleted.length > 0) {
+        state.lastTradeType = validCompleted[validCompleted.length - 1].type;
+      }
+    }
     renderSavedTrades();
   } catch (error) {
     els.savedTradesMeta.textContent = 'Sync failed';
@@ -365,6 +477,7 @@ function renderAll() {
   renderSimulation();
   renderSavedTrades();
   renderBadge();
+  renderSessionInfo();
 }
 
 function renderDashboard() {
@@ -379,22 +492,43 @@ function renderDashboard() {
   els.heroSideways.textContent = current ? (current.is_sideways ? 'Sideways' : 'Trending') : '-';
   els.historyMeta.textContent = state.dualData ? state.dualData.total_bars + ' bars loaded' : 'No bars loaded';
 
-  const rows = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history.slice(-20).reverse() : [];
-  els.historyTable.innerHTML = rows.length ? rows.map((bar) => `
-    <tr>
-      <td>${formatDateTime(bar.timestamp)}</td>
-      <td>${formatNumber(bar.close)}</td>
-      <td>${formatNumber(bar.short_vma)}</td>
-      <td>${formatNumber(bar.long_vma)}</td>
-      <td>${signalPill(bar.signal)}</td>
-      <td>${signalPill(bar.confirm_signal)}</td>
-      <td>${bar.quality ?? '-'}</td>
-    </tr>
-  `).join('') : '<tr><td class="empty-row" colspan="7">No history loaded yet.</td></tr>';
+  const allHistory = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history.slice().reverse() : [];
+  const totalItems = allHistory.length;
+
+  if (totalItems > 0) {
+    els.historyPagination.style.display = 'flex';
+    const totalPages = Math.ceil(totalItems / state.historyPageSize);
+    if (state.historyPage > totalPages) state.historyPage = totalPages;
+    if (state.historyPage < 1) state.historyPage = 1;
+
+    els.historyPageInfo.textContent = `Page ${state.historyPage} of ${totalPages}`;
+    els.historyPrevBtn.disabled = state.historyPage === 1;
+    els.historyNextBtn.disabled = state.historyPage === totalPages;
+
+    const startIdx = (state.historyPage - 1) * state.historyPageSize;
+    const endIdx = startIdx + state.historyPageSize;
+    const rows = allHistory.slice(startIdx, endIdx);
+
+    els.historyTable.innerHTML = rows.map((bar) => `
+      <tr>
+        <td>${formatDateTime(bar.timestamp)}</td>
+        <td>${formatNumber(bar.close)}</td>
+        <td>${formatNumber(bar.short_vma)}</td>
+        <td>${formatNumber(bar.long_vma)}</td>
+        <td>${signalPill(bar.signal)}</td>
+        <td>${signalPill(bar.confirm_signal)}</td>
+        <td>${bar.quality ?? '-'}</td>
+      </tr>
+    `).join('');
+  } else {
+    els.historyPagination.style.display = 'none';
+    els.historyTable.innerHTML = '<tr><td class="empty-row" colspan="7">No history loaded yet.</td></tr>';
+  }
 }
 
 function renderSimulation() {
-  const trades = state.simTrades;
+  const allRows = Array.isArray(state.savedTrades) ? state.savedTrades : [];
+  const trades = allRows.filter((t) => t.entryPrice != null && t.exitPrice != null && t.type);
   const wins = trades.filter((trade) => trade.grossPnl > 0);
   const losses = trades.filter((trade) => trade.grossPnl < 0);
   const pnl = trades.reduce((sum, trade) => sum + trade.grossPnl, 0);
@@ -403,29 +537,17 @@ function renderSimulation() {
   const avgW = wins.length ? wins.reduce((sum, trade) => sum + trade.grossPnl, 0) / wins.length : 0;
   const avgL = losses.length ? Math.abs(losses.reduce((sum, trade) => sum + trade.grossPnl, 0) / losses.length) : 0;
 
-  els.resultMeta.textContent = state.simParams ? state.simParams.instrument + ' | ' + state.simParams.slen + '/' + state.simParams.llen : 'No simulation yet';
+  const metaText = state.simParams ? state.simParams.instrument + ' | ' + state.simParams.slen + '/' + state.simParams.llen : 'No simulation yet';
+  if (els.resultMeta) els.resultMeta.textContent = metaText;
+  if (els.resultMetaInline) els.resultMetaInline.textContent = metaText;
   els.statTrades.textContent = String(trades.length);
   els.statWinRate.textContent = trades.length ? Math.round((wins.length / trades.length) * 100) + '%' : '-';
   els.statPnl.textContent = trades.length ? formatCurrency(pnl) : '-';
   els.statPnl.className = pnl >= 0 ? 'positive' : 'negative';
   els.statBest.textContent = best !== null ? formatCurrency(best) : '-';
   els.statWorst.textContent = worst !== null ? formatCurrency(worst) : '-';
-  els.statRR.textContent = avgL > 0 ? (avgW / avgL).toFixed(2) : '-';
-
-  els.tradesTable.innerHTML = trades.length ? trades.map((trade, index) => `
-    <tr>
-      <td>${index + 1}</td>
-      <td>${signalPill(trade.type)}</td>
-      <td>${formatDateTime(trade.entryTs)}</td>
-      <td>${formatNumber(trade.entryPrice)}</td>
-      <td>${formatNumber(trade.exitPrice)}</td>
-      <td>${formatNumber(trade.sl)}</td>
-      <td>${formatNumber(trade.tgt)}</td>
-      <td>${trade.lotSize}</td>
-      <td class="${trade.grossPnl >= 0 ? 'positive' : 'negative'}">${formatCurrency(trade.grossPnl)}</td>
-      <td>${reasonPill(trade.reason)}</td>
-    </tr>
-  `).join('') : '<tr><td class="empty-row" colspan="10">No completed trades in the current browser session.</td></tr>';
+  const rr = avgL > 0 ? (avgW / avgL) : 0;
+  els.statRR.textContent = trades.length ? (avgL > 0 ? Math.round((1 / (1 + rr)) * 100) + '%' : '0%') : '-';
 
   renderActivePosition();
   els.simBtn.textContent = state.simActive ? 'Stop Simulation' : 'Run Simulation';
@@ -434,11 +556,12 @@ function renderSimulation() {
 
 function renderActivePosition() {
   const pos = state.simPosition;
+  const card = els.activeTradeCard;
   if (!pos) {
-    els.activeTradeGrid.innerHTML = '<div class="active-cell"><span class="key">State</span><span class="value">No active position</span></div>';
+    if (card) card.style.display = 'none';
     return;
   }
-
+  if (card) card.style.display = 'block';
   const unrealized = (pos.lastPrice - pos.entry) * state.simParams.lotSize;
   els.activeTradeGrid.innerHTML = [
     cell('Type', pos.type),
@@ -453,15 +576,48 @@ function renderActivePosition() {
 }
 
 function renderSavedTrades() {
-  const rows = Array.isArray(state.savedTrades) ? state.savedTrades.slice().reverse().slice(0, 10) : [];
-  els.savedTradesTable.innerHTML = rows.length ? rows.map((trade) => `
-    <tr>
-      <td>${formatDateTime(trade.exitTs || trade.saved_at)}</td>
-      <td>${signalPill(trade.type || 'NONE')}</td>
-      <td>${trade.reason ? reasonPill(trade.reason) : '-'}</td>
-      <td class="${(trade.grossPnl || 0) >= 0 ? 'positive' : 'negative'}">${trade.grossPnl != null ? formatCurrency(trade.grossPnl) : '-'}</td>
-    </tr>
-  `).join('') : '<tr><td class="empty-row" colspan="4">No saved trades found yet.</td></tr>';
+  const allRows = Array.isArray(state.savedTrades) ? state.savedTrades.slice().reverse() : [];
+  const rows = allRows.filter((t) => t.entryPrice != null && t.exitPrice != null && t.type);
+
+  if (els.savedTradesMeta) els.savedTradesMeta.textContent = rows.length + ' trade' + (rows.length !== 1 ? 's' : '') + ' saved';
+
+  const totalItems = rows.length;
+  if (totalItems > 0) {
+    els.tradesPagination.style.display = 'flex';
+    const totalPages = Math.ceil(totalItems / state.tradesPageSize);
+    if (state.tradesPage > totalPages) state.tradesPage = totalPages;
+    if (state.tradesPage < 1) state.tradesPage = 1;
+
+    els.tradesPageInfo.textContent = `Page ${state.tradesPage} of ${totalPages}`;
+    els.tradesPrevBtn.disabled = state.tradesPage === 1;
+    els.tradesNextBtn.disabled = state.tradesPage === totalPages;
+
+    const startIdx = (state.tradesPage - 1) * state.tradesPageSize;
+    const endIdx = startIdx + state.tradesPageSize;
+    const pageRows = rows.slice(startIdx, endIdx);
+
+    els.savedTradesTable.innerHTML = pageRows.map((trade) => {
+      const pnl = trade.grossPnl != null ? trade.grossPnl : 0;
+      const trailSL = trade.trailSL != null ? trade.trailSL : null;
+      return `
+      <tr>
+        <td class="mono trade-symbol">${escapeHtml(trade.contract || trade.instrument || '—')}</td>
+        <td>${signalPill(trade.type)}</td>
+        <td class="mono">₹${formatNumber(trade.entryPrice)}</td>
+        <td class="mono">₹${formatNumber(trade.exitPrice)}</td>
+        <td class="mono sl-col">₹${formatNumber(trade.sl)}</td>
+        <td class="mono tgt-col">₹${formatNumber(trade.tgt)}</td>
+        <td class="mono">${trade.lotSize || '—'}</td>
+        <td class="trail-col">${trailSL != null ? '<span class="trail-check">✓</span><br><span class="mono trail-price">₹' + formatNumber(trailSL) + '</span>' : '<span class="muted-dash">—</span>'}</td>
+        <td>${reasonPill(trade.reason)}</td>
+        <td class="mono ${pnl >= 0 ? 'positive' : 'negative'}">${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}</td>
+        <td class="mono time-col">${formatTradeTime(trade.entryTs)}</td>
+      </tr>`;
+    }).join('');
+  } else {
+    els.tradesPagination.style.display = 'none';
+    els.savedTradesTable.innerHTML = '<tr><td class="empty-row" colspan="11">No saved trades yet.</td></tr>';
+  }
 }
 
 function renderBadge() {
@@ -471,15 +627,21 @@ function renderBadge() {
 }
 
 function setStatus(message, isError = false, isSuccess = false) {
+  if (!message) {
+    els.statusBox.style.display = 'none';
+    els.statusBox.textContent = '';
+    return;
+  }
   els.statusBox.textContent = message;
   els.statusBox.className = 'status-card';
   if (isError) els.statusBox.classList.add('error');
   if (isSuccess) els.statusBox.classList.add('success');
+  els.statusBox.style.display = 'flex';
 }
 
 function persistState() {
   const payload = {
-    version: 2,
+    version: 3,
     tf: els.timeframe.value,
     shortLen: els.shortLen.value,
     longLen: els.longLen.value,
@@ -509,6 +671,7 @@ function persistState() {
       simLastTs: state.simLastTs,
       lastSavedTradeCount: state.lastSavedTradeCount,
       savedTrades: state.savedTrades,
+      manualSessionPause: state.manualSessionPause,
     },
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -517,25 +680,30 @@ function persistState() {
 function restoreState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
+    if (!raw) {
+      applyDefaultFormValues();
+      return;
+    }
     const saved = JSON.parse(raw);
-    if (saved.shortLen) els.shortLen.value = saved.shortLen;
-    if (saved.longLen) els.longLen.value = saved.longLen;
-    if (saved.tf) els.timeframe.value = saved.tf;
-    if (saved.refreshInterval) els.refreshInterval.value = saved.refreshInterval;
+    els.shortLen.value = saved.shortLen || DEFAULTS.shortLen;
+    els.longLen.value = saved.longLen || DEFAULTS.longLen;
+    els.timeframe.value = saved.tf || DEFAULTS.timeframe;
+    els.refreshInterval.value = saved.refreshInterval || DEFAULTS.refreshInterval;
     if (saved.simFields) {
-      els.inpInstrument.value = saved.simFields.instrument || 'options';
-      els.inpSL.value = saved.simFields.sl || '20';
-      els.inpTarget.value = saved.simFields.target || '40';
-      els.inpTrailTrigger.value = saved.simFields.trailTrigger || '15';
-      els.inpTrailLock.value = saved.simFields.trailLock || '10';
-      els.inpLotSize.value = saved.simFields.lotSize || '65';
-      els.inpDelta.value = saved.simFields.delta || '0.5';
+      els.inpInstrument.value = saved.simFields.instrument || DEFAULTS.instrument;
+      els.inpSL.value = saved.simFields.sl || DEFAULTS.sl;
+      els.inpTarget.value = saved.simFields.target || DEFAULTS.target;
+      els.inpTrailTrigger.value = saved.simFields.trailTrigger || DEFAULTS.trailTrigger;
+      els.inpTrailLock.value = saved.simFields.trailLock || DEFAULTS.trailLock;
+      els.inpLotSize.value = saved.simFields.lotSize || DEFAULTS.lotSize;
+      els.inpDelta.value = saved.simFields.delta || DEFAULTS.delta;
       els.simShortLen.value = saved.simFields.simShortLen || els.shortLen.value;
       els.simLongLen.value = saved.simFields.simLongLen || els.longLen.value;
-      els.inpMinQuality.value = saved.simFields.minQuality || '2';
-      els.inpSidewaysFilter.checked = saved.simFields.sidewaysFilter !== false;
-      els.inpConfirmCandle.checked = saved.simFields.confirmCandle !== false;
+      els.inpMinQuality.value = saved.simFields.minQuality || DEFAULTS.minQuality;
+      els.inpSidewaysFilter.checked = saved.simFields.sidewaysFilter === true;
+      els.inpConfirmCandle.checked = saved.simFields.confirmCandle === true;
+    } else {
+      applyDefaultFormValues();
     }
     if (saved.runtime) {
       state.tf = saved.runtime.tf || els.timeframe.value;
@@ -548,15 +716,37 @@ function restoreState() {
       state.simLastTs = saved.runtime.simLastTs || null;
       state.lastSavedTradeCount = saved.runtime.lastSavedTradeCount || 0;
       state.savedTrades = Array.isArray(saved.runtime.savedTrades) ? saved.runtime.savedTrades : [];
+      state.manualSessionPause = Boolean(saved.runtime.manualSessionPause);
     }
   } catch (_) {
     localStorage.removeItem(STORAGE_KEY);
+    applyDefaultFormValues();
   }
+}
+
+function applyDefaultFormValues() {
+  els.timeframe.value = DEFAULTS.timeframe;
+  els.refreshInterval.value = DEFAULTS.refreshInterval;
+  els.inpInstrument.value = DEFAULTS.instrument;
+  els.inpSL.value = DEFAULTS.sl;
+  els.inpTarget.value = DEFAULTS.target;
+  els.inpTrailTrigger.value = DEFAULTS.trailTrigger;
+  els.inpTrailLock.value = DEFAULTS.trailLock;
+  els.inpLotSize.value = DEFAULTS.lotSize;
+  els.inpDelta.value = DEFAULTS.delta;
+  els.shortLen.value = DEFAULTS.shortLen;
+  els.longLen.value = DEFAULTS.longLen;
+  els.simShortLen.value = DEFAULTS.shortLen;
+  els.simLongLen.value = DEFAULTS.longLen;
+  els.inpMinQuality.value = DEFAULTS.minQuality;
+  els.inpSidewaysFilter.checked = DEFAULTS.sidewaysFilter;
+  els.inpConfirmCandle.checked = DEFAULTS.confirmCandle;
 }
 
 function syncFormToState() {
   updateInstrumentMode();
   renderBadge();
+  renderSessionInfo();
 }
 
 function resetSimulationForm() {
@@ -568,24 +758,108 @@ function resetSimulationForm() {
   state.simTrades = [];
   state.simLastTs = null;
   state.lastSavedTradeCount = 0;
-  els.inpInstrument.value = 'options';
-  els.inpSL.value = '20';
-  els.inpTarget.value = '40';
-  els.inpTrailTrigger.value = '15';
-  els.inpTrailLock.value = '10';
-  els.inpLotSize.value = '65';
-  els.inpDelta.value = '0.5';
-  els.shortLen.value = '9';
-  els.longLen.value = '21';
-  els.simShortLen.value = '9';
-  els.simLongLen.value = '21';
-  els.inpMinQuality.value = '2';
-  els.inpSidewaysFilter.checked = true;
-  els.inpConfirmCandle.checked = true;
+  state.manualSessionPause = false;
+  state.lastTradeType = null;
+  applyDefaultFormValues();
   updateInstrumentMode();
   renderSimulation();
+  renderSessionInfo();
   persistState();
-  setStatus('Simulation form reset. Cached browser state updated.', false, true);
+  setStatus('Simulation form reset with VMA 5/9 and the requested risk defaults.', false, true);
+}
+
+function startMarketClock() {
+  stopMarketClock();
+  renderSessionInfo();
+  state.clockTimer = window.setInterval(() => {
+    renderSessionInfo();
+    syncMarketSession();
+  }, 1000);
+}
+
+function stopMarketClock() {
+  if (state.clockTimer) {
+    window.clearInterval(state.clockTimer);
+    state.clockTimer = null;
+  }
+}
+
+function syncMarketSession(isInitial = false) {
+  const session = getMarketSessionState();
+  if (session.isOpen) {
+    if (state.simActive && !state.pollTimer) {
+      startPolling();
+    } else if (!state.simActive && !state.manualSessionPause) {
+      const started = startSimulation({ manual: false });
+      if (!started && isInitial) {
+        setStatus('Auto-start skipped because the current inputs are invalid.', true);
+      }
+    }
+  } else {
+    // Keep simulation and open trades active even after session hours as requested!
+    if (state.simActive && !state.pollTimer) {
+      startPolling();
+    } else if (isInitial) {
+      persistState();
+    }
+  }
+  renderSessionInfo(session);
+}
+
+function renderSessionInfo(providedSession) {
+  const session = providedSession || getMarketSessionState();
+  els.marketClock.textContent = session.clockLabel;
+  els.sessionStatus.textContent = session.statusLabel;
+  els.sessionWindow.textContent = '09:16 - 15:30 IST';
+}
+
+function getMarketSessionState() {
+  const parts = getIndiaDateParts();
+  const hour = Number(parts.hour);
+  const minute = Number(parts.minute);
+  const totalMinutes = hour * 60 + minute;
+  const weekday = parts.weekday;
+  const isWeekend = weekday === 'Sat' || weekday === 'Sun';
+
+  let statusLabel = 'Waiting for market open';
+  let isOpen = false;
+
+  if (isWeekend) {
+    statusLabel = 'Market closed for weekend';
+  } else if (totalMinutes < MARKET_WINDOW.startMinutes) {
+    statusLabel = 'Auto-start at 09:16 IST';
+  } else if (totalMinutes >= MARKET_WINDOW.endMinutes) {
+    statusLabel = 'Session closed at 15:30 IST';
+  } else {
+    isOpen = true;
+    statusLabel = state.manualSessionPause ? 'Paused manually until next session' : 'Live auto-run window active';
+  }
+
+  return {
+    isOpen,
+    clockLabel: parts.hour + ':' + parts.minute + ':' + parts.second + ' IST',
+    statusLabel,
+  };
+}
+
+function isMarketOpen() {
+  return getMarketSessionState().isOpen;
+}
+
+function getIndiaDateParts() {
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: INDIA_TIMEZONE,
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(new Date());
+  return parts.reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
 }
 
 function registerServiceWorker() {
@@ -599,9 +873,21 @@ function signalPill(value) {
   return '<span class="signal-pill ' + normalized + '">' + escapeHtml(String(value || 'NONE')) + '</span>';
 }
 
+function modePill(value) {
+  const normalized = String(value || 'MANUAL').toLowerCase();
+  return '<span class="mode-pill ' + normalized + '">' + escapeHtml(String(value || 'MANUAL')) + '</span>';
+}
+
 function reasonPill(value) {
-  const normalized = String(value || 'EOD').toLowerCase();
-  return '<span class="reason-pill ' + normalized + '">' + escapeHtml(String(value || 'EOD')) + '</span>';
+  const labelMap = {
+    'SL':          { label: 'SL_HIT',       cls: 'sl' },
+    'TRAILING_SL': { label: 'TRAIL_SL_HIT', cls: 'trailing_sl' },
+    'TARGET':      { label: 'TARGET',       cls: 'target' },
+    'EOD':         { label: 'EOD',          cls: 'eod' },
+    'MANUAL':      { label: 'MANUAL',       cls: 'manual_exit' },
+  };
+  const entry = labelMap[String(value)] || { label: String(value || 'EOD'), cls: 'eod' };
+  return '<span class="reason-pill ' + entry.cls + '">' + escapeHtml(entry.label) + '</span>';
 }
 
 function cell(key, value, extraClass = '') {
@@ -622,6 +908,15 @@ function formatDateTime(value) {
   return date ? date.toLocaleString() : '-';
 }
 
+function formatTradeTime(value) {
+  const date = asDate(value);
+  if (!date) return '-';
+  const day = date.getDate();
+  const month = date.toLocaleString('en-IN', { month: 'short', timeZone: 'Asia/Kolkata' });
+  const time = date.toLocaleString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' });
+  return day + '<br>' + month + '.<br>' + time;
+}
+
 function latestTimestamp() {
   const history = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
   return history.length ? history[history.length - 1].timestamp : new Date().toISOString();
@@ -637,8 +932,15 @@ function round(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
+function formatReasonLabel(value) {
+  return String(value || '')
+    .replaceAll('_', ' ')
+    .toLowerCase()
+    .replace(/\b[a-z]/g, (char) => char.toUpperCase());
+}
+
 function escapeHtml(value) {
-  return value
+  return String(value)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')

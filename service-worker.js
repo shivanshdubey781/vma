@@ -1,4 +1,4 @@
-﻿const CACHE_NAME = 'vma-shell-2026-05-27-1';
+const CACHE_NAME = 'vma-shell-2026-05-29-20';
 const APP_ASSETS = [
   '/',
   '/assets/index.css',
@@ -26,16 +26,17 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Network-First Strategy: try network first, fallback to cache if offline
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const networkFetch = fetch(event.request)
-        .then((response) => {
+    fetch(event.request)
+      .then((response) => {
+        if (response && response.status === 200) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          return response;
-        })
-        .catch(() => cached);
-      return cached || networkFetch;
-    })
+        }
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
+

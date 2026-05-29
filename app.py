@@ -217,7 +217,7 @@ class AngelOneClient:
 
         today = date.today()
         base_strike = round(spot_price / 50.0) * 50.0
-        strike = base_strike - 50.0 if side == "CE" else base_strike + 50.0
+        strike = base_strike
         candidates = [
             c for c in contracts
             if c["option_type"] == side and c["strike"] == strike and c["expiry_date"] and c["expiry_date"] >= today
@@ -353,6 +353,7 @@ def save_vma_trades(payload: dict):
     updated = 0
     meta = payload.get("meta") or {}
     for trade in trades:
+        trade.pop('mode', None)
         trade_key = build_trade_key(trade, meta)
         document = {
             **trade,

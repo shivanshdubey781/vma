@@ -19,7 +19,7 @@ def test_root_serves_dashboard():
     response = client.get("/")
 
     assert response.status_code == 200
-    assert b"Dual crossover control room" in response.data
+    assert b"VMA Dual Crossover Dashboard" in response.data
 
 
 def test_assets_route_serves_css():

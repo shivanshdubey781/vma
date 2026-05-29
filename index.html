@@ -1,36 +1,79 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VMA Dual Crossover Dashboard</title>
-<meta name="description" content="Production-ready VMA crossover dashboard for Nifty 50 simulations.">
+<meta name="description" content="Production-ready VMA crossover dashboard for Nifty 50 live simulations with real-time signal tracking.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@500;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/assets/index.css">
 </head>
 <body>
+  <!-- Animated background -->
+  <div class="bg-orbs" aria-hidden="true">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+  </div>
+
   <div class="app-shell">
+
+    <!-- ── Top Bar ── -->
     <header class="topbar">
-      <div>
-        <p class="eyebrow">VMA Engine</p>
-        <h1>Dual crossover control room</h1>
+      <div class="topbar-brand">
+        <div class="brand-icon" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+          </svg>
+        </div>
+        <div>
+          <p class="eyebrow">VMA Engine</p>
+          <h1 class="brand-title">Dual Crossover</h1>
+        </div>
+      </div>
+      <div class="topbar-center">
+        <div class="clock-block">
+          <span class="clock-label">IST</span>
+          <span class="clock-value mono" id="marketClock">--:--:--</span>
+        </div>
+        <div class="session-divider" aria-hidden="true"></div>
+        <div class="clock-block">
+          <span class="clock-label">Session</span>
+          <span class="clock-value session-val" id="sessionStatus">Loading…</span>
+        </div>
+        <div class="session-divider" aria-hidden="true"></div>
+        <div class="clock-block">
+          <span class="clock-label">Window</span>
+          <span class="clock-value mono" id="sessionWindow">09:16–15:30</span>
+        </div>
       </div>
       <div class="topbar-meta">
         <span class="badge badge-live" id="liveBadge">READY</span>
-        <span class="badge">NIFTY 50</span>
+        <span class="badge badge-index">NIFTY 50</span>
       </div>
     </header>
 
-    <section class="status-card" id="statusBox">Loading dashboard...</section>
+    <!-- ── Status Bar ── -->
+    <section class="status-card" id="statusBox" role="status" aria-live="polite" style="display: none;"></section>
 
+    <!-- ── Main Layout ── -->
     <main class="layout">
+
+      <!-- PRIMARY COLUMN -->
       <section class="primary-column">
+
+        <!-- Market Inputs -->
         <section class="panel controls-panel">
           <div class="panel-head">
-            <h2>Market Inputs</h2>
-            <button class="ghost-btn" id="calcBtn" type="button">Calculate</button>
+            <div class="panel-title-group">
+              <span class="panel-icon" aria-hidden="true">⚙️</span>
+              <h2>Market Inputs</h2>
+            </div>
+            <button class="ghost-btn" id="calcBtn" type="button">
+              <span>↻</span> Refresh
+            </button>
           </div>
           <div class="controls-grid">
             <div class="field-group">
@@ -60,32 +103,37 @@
           </div>
         </section>
 
-        <section class="hero-grid">
-          <article class="hero-card">
+        <!-- Hero Metrics -->
+        <section class="hero-grid" aria-label="Key metrics">
+          <article class="hero-card hero-signal-card">
             <p class="hero-label">Latest Signal</p>
-            <div class="hero-value" id="heroSignal">-</div>
-            <p class="hero-subtext" id="heroTimestamp">Waiting for data</p>
+            <div class="hero-value" id="heroSignal">—</div>
+            <p class="hero-subtext mono" id="heroTimestamp">Waiting for data</p>
           </article>
-          <article class="hero-card">
+          <article class="hero-card hero-vma-card">
             <p class="hero-label">Short / Long VMA</p>
-            <div class="hero-value mono" id="heroVma">-</div>
-            <p class="hero-subtext" id="heroPosition">-</p>
+            <div class="hero-value mono" id="heroVma">—</div>
+            <p class="hero-subtext" id="heroPosition">—</p>
           </article>
-          <article class="hero-card">
+          <article class="hero-card hero-price-card">
             <p class="hero-label">Close / RSI</p>
-            <div class="hero-value mono" id="heroClose">-</div>
-            <p class="hero-subtext" id="heroRsi">-</p>
+            <div class="hero-value mono" id="heroClose">—</div>
+            <p class="hero-subtext" id="heroRsi">—</p>
           </article>
-          <article class="hero-card">
-            <p class="hero-label">Quality / Sideways</p>
-            <div class="hero-value mono" id="heroQuality">-</div>
-            <p class="hero-subtext" id="heroSideways">-</p>
+          <article class="hero-card hero-quality-card">
+            <p class="hero-label">Quality / Market</p>
+            <div class="hero-value mono" id="heroQuality">—</div>
+            <p class="hero-subtext" id="heroSideways">—</p>
           </article>
         </section>
 
+        <!-- Signal History -->
         <section class="panel">
           <div class="panel-head">
-            <h2>Signal History</h2>
+            <div class="panel-title-group">
+              <span class="panel-icon" aria-hidden="true">📊</span>
+              <h2>Signal History</h2>
+            </div>
             <span class="mono subtle" id="historyMeta">No bars loaded</span>
           </div>
           <div class="table-wrap">
@@ -94,8 +142,8 @@
                 <tr>
                   <th>Time</th>
                   <th>Close</th>
-                  <th>Short</th>
-                  <th>Long</th>
+                  <th>Short VMA</th>
+                  <th>Long VMA</th>
                   <th>Signal</th>
                   <th>Confirm</th>
                   <th>Quality</th>
@@ -104,52 +152,63 @@
               <tbody id="historyTable"></tbody>
             </table>
           </div>
+          <div class="pagination-bar" id="historyPagination" style="display: none;">
+            <button class="pagination-btn" id="historyPrevBtn" type="button">◀ Previous</button>
+            <span class="pagination-info" id="historyPageInfo">Page 1 of 1</span>
+            <button class="pagination-btn" id="historyNextBtn" type="button">Next ▶</button>
+          </div>
         </section>
 
+        <!-- Simulation Results -->
         <section class="panel">
           <div class="panel-head">
-            <h2>Simulation Result</h2>
-            <span class="mono subtle" id="resultMeta">No simulation yet</span>
+            <div class="panel-title-group">
+              <span class="panel-icon" aria-hidden="true">📈</span>
+              <h2>Simulation Result</h2>
+            </div>
+            <span class="mono subtle" id="resultMetaInline">No simulation yet</span>
           </div>
           <div class="stats-grid">
-            <article class="stat-card"><span>Trades</span><strong id="statTrades">0</strong></article>
-            <article class="stat-card"><span>Win Rate</span><strong id="statWinRate">-</strong></article>
-            <article class="stat-card"><span>Net P&amp;L</span><strong id="statPnl">-</strong></article>
-            <article class="stat-card"><span>Best</span><strong id="statBest">-</strong></article>
-            <article class="stat-card"><span>Worst</span><strong id="statWorst">-</strong></article>
-            <article class="stat-card"><span>R:R</span><strong id="statRR">-</strong></article>
-          </div>
-          <div class="active-trade" id="activeTradeCard">
-            <h3>Active Position</h3>
-            <div class="active-grid" id="activeTradeGrid"></div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Type</th>
-                  <th>Entry Time</th>
-                  <th>Entry</th>
-                  <th>Exit</th>
-                  <th>SL</th>
-                  <th>Target</th>
-                  <th>Lot</th>
-                  <th>P&amp;L</th>
-                  <th>Reason</th>
-                </tr>
-              </thead>
-              <tbody id="tradesTable"></tbody>
-            </table>
+            <article class="stat-card">
+              <span>Trades</span>
+              <strong id="statTrades">0</strong>
+            </article>
+            <article class="stat-card">
+              <span>Win Rate</span>
+              <strong id="statWinRate">—</strong>
+            </article>
+            <article class="stat-card">
+              <span>Net P&amp;L</span>
+              <strong id="statPnl">—</strong>
+            </article>
+            <article class="stat-card">
+              <span>Best</span>
+              <strong id="statBest">—</strong>
+            </article>
+            <article class="stat-card">
+              <span>Worst</span>
+              <strong id="statWorst">—</strong>
+            </article>
+            <article class="stat-card">
+              <span>Req. Win %</span>
+              <strong id="statRR">—</strong>
+            </article>
           </div>
         </section>
-      </section>
 
+
+      </section><!-- /primary-column -->
+
+      <!-- SIDE PANEL -->
       <aside class="panel side-panel">
         <div class="panel-head">
-          <h2>Simulation Controls</h2>
+          <div class="panel-title-group">
+            <span class="panel-icon" aria-hidden="true">🎮</span>
+            <h2>Simulation Controls</h2>
+          </div>
           <button class="ghost-btn" id="resetBtn" type="button">Reset</button>
         </div>
+
         <div class="side-form">
           <div class="field-group">
             <label for="inpInstrument">Instrument</label>
@@ -161,21 +220,21 @@
           <div class="field-row">
             <div class="field-group">
               <label for="inpSL">Stop Loss</label>
-              <input id="inpSL" type="number" min="1" value="20">
+              <input id="inpSL" type="number" min="1" value="40">
             </div>
             <div class="field-group">
               <label for="inpTarget">Target</label>
-              <input id="inpTarget" type="number" min="1" value="40">
+              <input id="inpTarget" type="number" min="1" value="60">
             </div>
           </div>
           <div class="field-row">
             <div class="field-group">
               <label for="inpTrailTrigger">Trail Trigger</label>
-              <input id="inpTrailTrigger" type="number" min="0" value="15">
+              <input id="inpTrailTrigger" type="number" min="0" value="25">
             </div>
             <div class="field-group">
               <label for="inpTrailLock">Trail Lock</label>
-              <input id="inpTrailLock" type="number" min="0" value="10">
+              <input id="inpTrailLock" type="number" min="0" value="15">
             </div>
           </div>
           <div class="field-row">
@@ -198,40 +257,72 @@
               <input id="simLongLen" type="number" min="2" value="21">
             </div>
           </div>
-          <div class="field-row">
+          <div class="field-row" style="display: none;">
             <div class="field-group">
               <label for="inpMinQuality">Min Quality</label>
               <input id="inpMinQuality" type="number" min="0" max="5" value="2">
             </div>
             <div class="field-group toggles">
-              <label><input id="inpSidewaysFilter" type="checkbox" checked> Skip Sideways</label>
-              <label><input id="inpConfirmCandle" type="checkbox" checked> Use Confirm Candle</label>
+              <label class="toggle-label"><input id="inpSidewaysFilter" type="checkbox"> Skip Sideways</label>
+              <label class="toggle-label"><input id="inpConfirmCandle" type="checkbox"> Confirm Candle</label>
             </div>
           </div>
-          <button class="action-btn" id="simBtn" type="button">Run Simulation</button>
+          <button class="action-btn" id="simBtn" type="button">▶ Run Simulation</button>
         </div>
-
-        <section class="saved-trades">
-          <div class="panel-head compact">
-            <h3>Saved Trades</h3>
-            <span class="mono subtle" id="savedTradesMeta">Sync pending</span>
-          </div>
-          <div class="table-wrap compact">
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Type</th>
-                  <th>Exit</th>
-                  <th>P&amp;L</th>
-                </tr>
-              </thead>
-              <tbody id="savedTradesTable"></tbody>
-            </table>
-          </div>
-        </section>
       </aside>
+
     </main>
+
+    <!-- ── Full-Width Trade History ── -->
+    <section class="panel trade-history-panel">
+      <div class="panel-head">
+        <div class="panel-title-group">
+          <span class="panel-icon" aria-hidden="true">🧾</span>
+          <h2>Trade History</h2>
+          <span class="mono subtle" id="savedTradesMeta">Sync pending</span>
+        </div>
+        <span class="mono subtle" id="resultMeta">No simulation yet</span>
+      </div>
+
+      <!-- Active Position row -->
+      <div class="active-trade" id="activeTradeCard" style="display:none">
+        <div class="active-trade-header">
+          <h3 class="active-trade-title">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            Active Position
+          </h3>
+          <button class="square-off-btn" id="closeActiveTradeBtn" type="button">✖ Square Off</button>
+        </div>
+        <div class="active-grid" id="activeTradeGrid"></div>
+      </div>
+
+      <div class="table-wrap trade-history-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Dir</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>SL</th>
+              <th>Target</th>
+              <th>Lots</th>
+              <th>Trail SL</th>
+              <th>Exit Reason</th>
+              <th>P&amp;L</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="savedTradesTable"></tbody>
+        </table>
+      </div>
+      <div class="pagination-bar" id="tradesPagination" style="display: none;">
+        <button class="pagination-btn" id="tradesPrevBtn" type="button">◀ Previous</button>
+        <span class="pagination-info" id="tradesPageInfo">Page 1 of 1</span>
+        <button class="pagination-btn" id="tradesNextBtn" type="button">Next ▶</button>
+      </div>
+    </section>
+
   </div>
 
   <script src="/assets/index.js" defer></script>
