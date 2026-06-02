@@ -4,7 +4,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from dotenv import load_dotenv
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time, timedelta, timezone
 import base64
 import hashlib
 import hmac
@@ -33,7 +33,7 @@ MONGO_URI = os.getenv("MONGO_URI", "").strip()
 DB_NAME = os.getenv("MONGO_DB", "trading_bot_db").strip() or "trading_bot_db"
 VMA_RESULTS_COLLECTION = "vma_results"
 VMA_TRADES_COLLECTION = "vma_trades"
-VMA_RETENTION_SECONDS = 3 * 24 * 60 * 60
+IST = timezone(timedelta(hours=5, minutes=30))
 COLLECTION_MAP = {
     "1min": "OHLC",
     "3min": "OHLC3",
@@ -315,18 +315,38 @@ def archive_expired_vma_results():
     ensure_vma_housekeeping()
     db = get_db()
     cutoff = datetime.utcnow()
-    cursor = db[VMA_RESULTS_COLLECTION].find({"expires_at": {"$lte": cutoff}})
-    for document in cursor:
-        source_id = str(document["_id"])
-        archive_doc = {k: v for k, v in document.items() if k != "_id"}
-        archive_doc["source_result_id"] = source_id
-        archive_doc["archived_at"] = cutoff
-        db[VMA_TRADES_COLLECTION].replace_one(
-            {"source_result_id": source_id},
-            archive_doc,
-            upsert=True,
-        )
-        db[VMA_RESULTS_COLLECTION].delete_one({"_id": document["_id"]})
+    today_ist = datetime.now(IST).date()
+    start_of_today_ist_utc = datetime.combine(today_ist, dt_time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    db[VMA_RESULTS_COLLECTION].delete_many(
+        {
+            "$or": [
+                {"expires_at": {"$lte": cutoff}},
+                {"saved_at": {"$lt": start_of_today_ist_utc}},
+            ]
+        }
+    )
+
+
+def prune_non_trade_vma_history():
+    """
+    Remove misfiled snapshot documents from the trades collection.
+    Only actual trade records should live in VMA_TRADES_COLLECTION.
+    """
+    ensure_vma_housekeeping()
+    db = get_db()
+    db[VMA_TRADES_COLLECTION].delete_many(
+        {
+            "$or": [
+                {"kind": {"$in": ["dual_vma", "single_vma"]}},
+                {
+                    "$and": [
+                        {"source_result_id": {"$exists": True}},
+                        {"trade_key": {"$exists": False}},
+                    ]
+                },
+            ]
+        }
+    )
 
 
 def save_vma_result_snapshot(payload: dict):
@@ -334,7 +354,9 @@ def save_vma_result_snapshot(payload: dict):
     archive_expired_vma_results()
     db = get_db()
     saved_at = datetime.utcnow()
-    expires_at = datetime.utcfromtimestamp(saved_at.timestamp() + VMA_RETENTION_SECONDS)
+    saved_at_ist = saved_at.replace(tzinfo=timezone.utc).astimezone(IST)
+    next_ist_midnight = datetime.combine(saved_at_ist.date() + timedelta(days=1), dt_time.min, tzinfo=IST)
+    expires_at = next_ist_midnight.astimezone(timezone.utc).replace(tzinfo=None)
     document = {
         **payload,
         "saved_at": saved_at,
@@ -346,6 +368,7 @@ def save_vma_result_snapshot(payload: dict):
 def save_vma_trades(payload: dict):
     ensure_vma_housekeeping()
     archive_expired_vma_results()
+    prune_non_trade_vma_history()
     db = get_db()
     saved_at = datetime.utcnow()
     trades = payload.get("trades") or []
@@ -400,10 +423,11 @@ def build_trade_key(trade: dict, meta: dict) -> str:
 def fetch_saved_vma_trades(limit: int = 100) -> list[dict]:
     ensure_vma_housekeeping()
     archive_expired_vma_results()
+    prune_non_trade_vma_history()
     db = get_db()
     docs = list(
         db[VMA_TRADES_COLLECTION]
-        .find({}, {"_id": 0})
+        .find({"trade_key": {"$exists": True}}, {"_id": 0})
         .sort([("saved_at", DESCENDING)])
         .limit(limit)
     )

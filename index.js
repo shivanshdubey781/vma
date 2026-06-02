@@ -160,7 +160,8 @@ function startSimulation(options = {}) {
   if (!simParams) return false;
   state.manualSessionPause = false;
   state.simActive = true;
-  state.simStartTime = new Date(Date.now() - 90 * 1000).toISOString();
+  const lookbackMs = getSimulationLookbackMs(els.timeframe.value, simParams.confirmCandle);
+  state.simStartTime = new Date(Date.now() - lookbackMs).toISOString();
   state.simParams = simParams;
   state.simPosition = null;
   state.simTrades = [];
@@ -381,6 +382,7 @@ function buildTrade(position, exitPrice, exitTs, reason) {
     type: position.type,
     instrument: position.instrument,
     contract: position.contract || null,
+    expiry: position.expiry || null,
     entryTs: position.entryTs,
     entryPrice: round(position.entry),
     exitTs: exitTs,
@@ -472,6 +474,57 @@ function readSimulationParams() {
   return params;
 }
 
+function getDashboardSimParams() {
+  return {
+    minQuality: parseInt(els.inpMinQuality.value, 10) || 0,
+    sidewaysFilter: els.inpSidewaysFilter.checked,
+    confirmCandle: els.inpConfirmCandle.checked,
+  };
+}
+
+function analyzeHistoryDecisions(history, simParams) {
+  const bars = Array.isArray(history) ? history : [];
+  let lastAcceptedSignal = null;
+
+  return bars.map((bar) => {
+    const decision = getBarDecision(bar, simParams, lastAcceptedSignal);
+    if (decision.eligible) {
+      lastAcceptedSignal = decision.entrySignal;
+    }
+    return {
+      ...bar,
+      skipReason: decision.reason,
+      entrySignal: decision.entrySignal,
+    };
+  });
+}
+
+function getBarDecision(bar, simParams, lastAcceptedSignal) {
+  const entrySignal = simParams.confirmCandle ? bar.confirm_signal : bar.signal;
+  const hasDirectSignal = bar.signal === 'CE' || bar.signal === 'PE';
+
+  if (entrySignal !== 'CE' && entrySignal !== 'PE') {
+    if (simParams.confirmCandle && hasDirectSignal) {
+      return { eligible: false, reason: 'Waiting for confirm candle', entrySignal: 'NONE' };
+    }
+    return { eligible: false, reason: 'No entry signal', entrySignal: 'NONE' };
+  }
+
+  if (lastAcceptedSignal && lastAcceptedSignal === entrySignal) {
+    return { eligible: false, reason: 'Same side as last trade', entrySignal };
+  }
+
+  if (simParams.sidewaysFilter && bar.is_sideways) {
+    return { eligible: false, reason: 'Sideways filter blocked', entrySignal };
+  }
+
+  if ((bar.quality || 0) < simParams.minQuality) {
+    return { eligible: false, reason: `Quality ${bar.quality || 0} below min ${simParams.minQuality}`, entrySignal };
+  }
+
+  return { eligible: true, reason: 'Eligible', entrySignal };
+}
+
 function renderAll() {
   renderDashboard();
   renderSimulation();
@@ -492,7 +545,8 @@ function renderDashboard() {
   els.heroSideways.textContent = current ? (current.is_sideways ? 'Sideways' : 'Trending') : '-';
   els.historyMeta.textContent = state.dualData ? state.dualData.total_bars + ' bars loaded' : 'No bars loaded';
 
-  const allHistory = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history.slice().reverse() : [];
+  const rawHistory = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
+  const allHistory = analyzeHistoryDecisions(rawHistory, getDashboardSimParams()).slice().reverse();
   const totalItems = allHistory.length;
 
   if (totalItems > 0) {
@@ -518,11 +572,12 @@ function renderDashboard() {
         <td>${signalPill(bar.signal)}</td>
         <td>${signalPill(bar.confirm_signal)}</td>
         <td>${bar.quality ?? '-'}</td>
+        <td>${escapeHtml(bar.skipReason || '-')}</td>
       </tr>
     `).join('');
   } else {
     els.historyPagination.style.display = 'none';
-    els.historyTable.innerHTML = '<tr><td class="empty-row" colspan="7">No history loaded yet.</td></tr>';
+    els.historyTable.innerHTML = '<tr><td class="empty-row" colspan="8">No history loaded yet.</td></tr>';
   }
 }
 
@@ -599,6 +654,8 @@ function renderSavedTrades() {
     els.savedTradesTable.innerHTML = pageRows.map((trade) => {
       const pnl = trade.grossPnl != null ? trade.grossPnl : 0;
       const trailSL = trade.trailSL != null ? trade.trailSL : null;
+      const symbolLabel = formatTradeSymbol(trade);
+      trade.contract = symbolLabel;
       return `
       <tr>
         <td class="mono trade-symbol">${escapeHtml(trade.contract || trade.instrument || '—')}</td>
@@ -917,6 +974,35 @@ function formatTradeTime(value) {
   return day + '<br>' + month + '.<br>' + time;
 }
 
+function formatTradeSymbol(trade) {
+  return trade?.tradingsymbol || trade?.contract || trade?.instrument || '-';
+}
+
+function formatOptionExpiryLabel(value) {
+  if (!value) return '';
+
+  const date = asDate(value);
+  if (date) {
+    const day = date.toLocaleString('en-IN', { day: 'numeric', timeZone: INDIA_TIMEZONE });
+    const month = date.toLocaleString('en-IN', { month: 'short', timeZone: INDIA_TIMEZONE });
+    return `${day} ${month}`;
+  }
+
+  const raw = String(value).trim().toUpperCase();
+  const match = raw.match(/^(\d{1,2})([A-Z]{3})(\d{2}|\d{4})?$/);
+  if (!match) return '';
+
+  const day = String(parseInt(match[1], 10));
+  const month = match[2].charAt(0) + match[2].slice(1).toLowerCase();
+  return `${day} ${month}`;
+}
+
+function extractExpiryFromContract(contract) {
+  const raw = String(contract || '').trim().toUpperCase();
+  const match = raw.match(/^NIFTY(\d{1,2}[A-Z]{3}\d{2,4})\d+(CE|PE)$/);
+  return match ? match[1] : '';
+}
+
 function latestTimestamp() {
   const history = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
   return history.length ? history[history.length - 1].timestamp : new Date().toISOString();
@@ -926,6 +1012,22 @@ function asDate(value) {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function timeframeToMs(value) {
+  const match = String(value || '').trim().match(/^(\d+)\s*(min|m|hour|hr|h|day|d)$/i);
+  if (!match) return 60 * 1000;
+  const amount = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit === 'day' || unit === 'd') return amount * 24 * 60 * 60 * 1000;
+  if (unit === 'hour' || unit === 'hr' || unit === 'h') return amount * 60 * 60 * 1000;
+  return amount * 60 * 1000;
+}
+
+function getSimulationLookbackMs(timeframe, confirmCandle) {
+  const timeframeMs = timeframeToMs(timeframe);
+  const barsNeeded = confirmCandle ? 3 : 2;
+  return Math.max(90 * 1000, timeframeMs * barsNeeded);
 }
 
 function round(value) {
