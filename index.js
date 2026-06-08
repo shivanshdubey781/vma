@@ -6,6 +6,12 @@ const MARKET_WINDOW = Object.freeze({
   startMinutes: 9 * 60 + 16,
   endMinutes: 15 * 60 + 30,
 });
+// EOD auto square-off window: 15:20–15:25 exit trade, 15:25+ stop simulation
+const EOD_WINDOW = Object.freeze({
+  exitFromMinutes: 15 * 60 + 20,
+  exitUntilMinutes: 15 * 60 + 25,
+  stopFromMinutes: 15 * 60 + 25,
+});
 const DEFAULTS = Object.freeze({
   timeframe: '5min',
   shortLen: '5',
@@ -30,6 +36,7 @@ const state = {
   simStartTime: null,
   simParams: null,
   simPosition: null,
+  simSessionId: null,
   simTrades: [],
   simLastTs: null,
   lastSavedTradeCount: 0,
@@ -42,6 +49,9 @@ const state = {
   tradesPage: 1,
   tradesPageSize: 10,
   lastTradeType: null,
+  // EOD date guards – store the IST date string ('YYYY-MM-DD') when action was last taken
+  eodExitDoneDate: null,
+  eodStopDoneDate: null,
 };
 
 const els = {};
@@ -55,6 +65,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderAll();
   startMarketClock();
   await Promise.all([loadDashboard(), loadSavedTrades()]);
+  await loadBackendActiveTrade();
   syncMarketSession(true);
 });
 
@@ -80,9 +91,10 @@ function bindEvents() {
   els.inpInstrument.addEventListener('change', updateInstrumentMode);
   ['shortLen', 'simShortLen'].forEach((id) => els[id].addEventListener('input', syncLengthFields));
   ['longLen', 'simLongLen'].forEach((id) => els[id].addEventListener('input', syncLengthFields));
-  ['timeframe', 'refreshInterval', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock', 'inpLotSize', 'inpDelta', 'inpMinQuality', 'inpSidewaysFilter', 'inpConfirmCandle'].forEach((id) => {
+  ['refreshInterval', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock', 'inpLotSize', 'inpDelta', 'inpMinQuality', 'inpSidewaysFilter', 'inpConfirmCandle'].forEach((id) => {
     els[id].addEventListener('change', persistState);
   });
+  els.timeframe.addEventListener('change', handleTimeframeChange);
   els.closeActiveTradeBtn.addEventListener('click', closeActivePositionManually);
   els.historyPrevBtn.addEventListener('click', () => {
     if (state.historyPage > 1) {
@@ -129,6 +141,39 @@ function updateInstrumentMode() {
   persistState();
 }
 
+async function handleTimeframeChange() {
+  persistState();
+
+  // Always reload the dashboard with the new timeframe so the chart/history updates.
+  await loadDashboard(false);
+
+  // If the simulation is running, seamlessly restart it on the new timeframe.
+  if (state.simActive) {
+    const newTf = els.timeframe.value;
+
+    // Close any open position at last known price before switching.
+    if (state.simPosition) {
+      closeOpenPosition('TF_SWITCH');
+      await persistCompletedTrades();
+    }
+
+    // Reset simulation state for the fresh timeframe (keep same risk params).
+    state.simLastTs = null;
+    state.simTrades = [];
+    state.lastSavedTradeCount = 0;
+    state.lastTradeType = null;
+    state.simPosition = null;
+    state.simStartTime = resolveSimulationStartTime(state.simParams);
+    state.simSessionId = buildSimulationSessionId(state.simParams);
+    state.tf = newTf;
+
+    startPolling();
+    renderAll();
+    persistState();
+    setStatus(`Timeframe switched to ${newTf}. Simulation auto-restarted.`, false, true);
+  }
+}
+
 async function loadDashboard(showMessage = false) {
   const tf = els.timeframe.value;
   const shortLen = parseInt(els.shortLen.value, 10);
@@ -160,12 +205,13 @@ function startSimulation(options = {}) {
   if (!simParams) return false;
   state.manualSessionPause = false;
   state.simActive = true;
-  const lookbackMs = getSimulationLookbackMs(els.timeframe.value, simParams.confirmCandle);
-  state.simStartTime = new Date(Date.now() - lookbackMs).toISOString();
+  state.simStartTime = resolveSimulationStartTime(simParams);
+  state.simSessionId = buildSimulationSessionId(simParams);
   state.simParams = simParams;
   state.simPosition = null;
   state.simTrades = [];
   state.simLastTs = null;
+  state.lastTradeType = null;
   state.lastSavedTradeCount = 0;
   renderSimulation();
   setStatus(options.manual ? 'Simulation started manually.' : 'Simulation auto-started for the live market session.', false, true);
@@ -253,7 +299,7 @@ async function processBar(bar) {
     return;
   }
 
-  const signal = state.simParams.confirmCandle ? bar.confirm_signal : bar.signal;
+  const signal = getEntrySignal(bar, state.simParams);
   if (!['CE', 'PE'].includes(signal)) return;
 
   // Alternation Logic: strictly alternate CE and PE trades
@@ -295,6 +341,7 @@ async function processBar(bar) {
       lastSpot: entry,
     };
   }
+  await syncActiveTrade('ACTIVE');
   persistState();
 }
 
@@ -329,6 +376,7 @@ async function updateOpenPosition(bar) {
       if (bar.low <= pos.tgt) return completeTrade(pos.tgt, bar.timestamp, 'TARGET');
     }
   }
+  await syncActiveTrade('ACTIVE');
 }
 
 function closeOpenPosition(reason) {
@@ -361,6 +409,7 @@ function completeTrade(exitPrice, exitTs, reason) {
   state.simTrades.push(trade);
   state.lastTradeType = trade.type;
   state.simPosition = null;
+  syncActiveTrade('CLOSED', trade).catch((error) => setStatus('Active trade close sync failed: ' + error.message, true));
   persistState();
 }
 
@@ -431,6 +480,74 @@ async function persistCompletedTrades() {
   await loadSavedTrades();
 }
 
+async function syncActiveTrade(status = 'ACTIVE', trade = null) {
+  if (!state.simSessionId || !state.simParams) return;
+
+  const payload = {
+    session_id: state.simSessionId,
+    status,
+    position: state.simPosition,
+    trade,
+    opened_at: state.simPosition ? state.simPosition.entryTs : null,
+    closed_at: trade ? trade.exitTs : null,
+    meta: {
+      timeframe: state.tf,
+      started_at: state.simStartTime,
+      params: state.simParams,
+    },
+  };
+
+  const response = await fetch('/api/vma-active-trade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const json = await readApiJson(response, 'Active trade sync failed');
+  if (!json.ok) throw new Error(json.error || 'Active trade sync failed');
+}
+
+async function loadBackendActiveTrade() {
+  try {
+    const response = await fetch('/api/vma-active-trade', { cache: 'no-store' });
+    const json = await readApiJson(response, 'Backend active trade sync failed');
+    if (!json.ok || !json.active_trade || !json.active_trade.position) return;
+
+    const active = json.active_trade;
+    if (!state.simPosition) {
+      state.simPosition = active.position;
+      state.simParams = active.meta && active.meta.params ? active.meta.params : state.simParams;
+      state.simStartTime = active.meta && active.meta.started_at ? active.meta.started_at : state.simStartTime;
+      state.simSessionId = active.session_id || state.simSessionId;
+      state.simActive = true;
+      startPolling();
+      renderAll();
+      persistState();
+      setStatus('Backend active simulation trade restored.', false, true);
+    }
+  } catch (error) {
+    setStatus('Backend active trade sync failed: ' + error.message, true);
+  }
+}
+
+async function readApiJson(response, fallbackMessage) {
+  const contentType = response.headers.get('content-type') || '';
+  const text = await response.text();
+
+  if (!contentType.includes('application/json')) {
+    const preview = text.replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (preview.toLowerCase().startsWith('<!doctype') || preview.startsWith('<')) {
+      throw new Error(`${fallbackMessage}: backend returned an HTML page for ${response.url}. Restart the Flask/Docker backend so the latest API routes are loaded.`);
+    }
+    throw new Error(`${fallbackMessage}: backend returned ${response.status || 'non-JSON'} ${preview}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${fallbackMessage}: invalid JSON response`);
+  }
+}
+
 async function loadSavedTrades() {
   try {
     const response = await fetch('/api/vma-trades?limit=50', { cache: 'no-store' });
@@ -449,6 +566,18 @@ async function loadSavedTrades() {
     els.savedTradesMeta.textContent = 'Sync failed';
     setStatus('Saved trades sync failed: ' + error.message, true);
   }
+}
+
+function buildSimulationSessionId(simParams) {
+  const raw = [
+    state.simStartTime || new Date().toISOString(),
+    els.timeframe.value,
+    simParams.instrument,
+    simParams.slen,
+    simParams.llen,
+    Date.now(),
+  ].join('|');
+  return 'sim-' + hashString(raw);
 }
 
 function readSimulationParams() {
@@ -499,8 +628,21 @@ function analyzeHistoryDecisions(history, simParams) {
   });
 }
 
+function resolveSimulationStartTime(simParams) {
+  const history = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
+  const analyzed = analyzeHistoryDecisions(history, simParams);
+  const latestEligible = analyzed.slice().reverse().find((bar) => bar.skipReason === 'Eligible');
+
+  if (latestEligible && latestEligible.timestamp) {
+    return latestEligible.timestamp;
+  }
+
+  const lookbackMs = getSimulationLookbackMs(els.timeframe.value, simParams.confirmCandle);
+  return new Date(Date.now() - lookbackMs).toISOString();
+}
+
 function getBarDecision(bar, simParams, lastAcceptedSignal) {
-  const entrySignal = simParams.confirmCandle ? bar.confirm_signal : bar.signal;
+  const entrySignal = getEntrySignal(bar, simParams);
   const hasDirectSignal = bar.signal === 'CE' || bar.signal === 'PE';
 
   if (entrySignal !== 'CE' && entrySignal !== 'PE') {
@@ -525,6 +667,15 @@ function getBarDecision(bar, simParams, lastAcceptedSignal) {
   return { eligible: true, reason: 'Eligible', entrySignal };
 }
 
+function getEntrySignal(bar, simParams) {
+  const directSignal = bar.signal === 'CE' || bar.signal === 'PE' ? bar.signal : 'NONE';
+  const confirmedSignal = bar.confirm_signal === 'CE' || bar.confirm_signal === 'PE' ? bar.confirm_signal : 'NONE';
+
+  if (simParams.confirmCandle) return confirmedSignal;
+  if (simParams.minQuality > 0 && confirmedSignal !== 'NONE') return confirmedSignal;
+  return directSignal;
+}
+
 function renderAll() {
   renderDashboard();
   renderSimulation();
@@ -535,7 +686,7 @@ function renderAll() {
 
 function renderDashboard() {
   const current = state.dualData && state.dualData.current ? state.dualData.current : null;
-  els.heroSignal.textContent = current ? (current.signal || current.confirm_signal || 'NONE') : '-';
+  els.heroSignal.textContent = current ? getEntrySignal(current, getDashboardSimParams()) : '-';
   els.heroTimestamp.textContent = current ? formatDateTime(current.timestamp) : 'Waiting for data';
   els.heroVma.textContent = current ? formatNumber(current.short_vma) + ' / ' + formatNumber(current.long_vma) : '-';
   els.heroPosition.textContent = current ? (current.position || '-') : '-';
@@ -722,6 +873,7 @@ function persistState() {
       dualData: state.dualData,
       simActive: state.simActive,
       simStartTime: state.simStartTime,
+      simSessionId: state.simSessionId,
       simParams: state.simParams,
       simPosition: state.simPosition,
       simTrades: state.simTrades,
@@ -767,6 +919,7 @@ function restoreState() {
       state.dualData = saved.runtime.dualData || null;
       state.simActive = saved.runtime.simActive || false;
       state.simStartTime = saved.runtime.simStartTime || null;
+      state.simSessionId = saved.runtime.simSessionId || null;
       state.simParams = saved.runtime.simParams || null;
       state.simPosition = saved.runtime.simPosition || null;
       state.simTrades = Array.isArray(saved.runtime.simTrades) ? saved.runtime.simTrades : [];
@@ -810,6 +963,7 @@ function resetSimulationForm() {
   stopPolling();
   state.simActive = false;
   state.simStartTime = null;
+  state.simSessionId = null;
   state.simParams = null;
   state.simPosition = null;
   state.simTrades = [];
@@ -825,12 +979,54 @@ function resetSimulationForm() {
   setStatus('Simulation form reset with VMA 5/9 and the requested risk defaults.', false, true);
 }
 
+// ── EOD Auto Square-Off ─────────────────────────────────────────────────────
+// Mirrors handle_eod_auto_controls() from the Python backend exactly:
+//   15:20–15:25 IST → force-exit any active position once per day
+//   15:25+ IST      → stop the simulation once per day
+async function handleEodAutoControls() {
+  const parts = getIndiaDateParts();
+  const hhmm = Number(parts.hour) * 100 + Number(parts.minute);
+  // Build today's IST date string 'YYYY-MM-DD'
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+
+  // ── 15:20–15:25: force-exit open trade once per day ─────────────────────
+  if (hhmm >= 1520 && hhmm < 1525 && state.eodExitDoneDate !== today) {
+    state.eodExitDoneDate = today;   // guard first – prevents re-entry even if await takes time
+    if (state.simPosition) {
+      const reason = 'EOD_AUTO';
+      if (!state.simParams) {
+        state.simParams = {
+          lotSize: parseInt(els.inpLotSize.value, 10) || 65,
+          delta: parseFloat(els.inpDelta.value) || 0.5,
+          instrument: els.inpInstrument.value || 'options',
+        };
+      }
+      completeTrade(state.simPosition.lastPrice || state.simPosition.entry, latestTimestamp(), reason);
+      renderAll();
+      await persistCompletedTrades();
+      persistState();
+      setStatus('⏰ EOD Auto Square-Off: position closed at 15:20 IST.', false, true);
+    }
+  }
+
+  // ── 15:25+: stop simulation once per day ────────────────────────────────
+  if (hhmm >= 1525 && state.eodStopDoneDate !== today) {
+    state.eodStopDoneDate = today;   // guard first
+    if (state.simActive) {
+      stopSimulation({ reason: 'EOD' });
+      setStatus('🔴 Simulation auto-stopped at 15:25 IST. Will resume next session.', false, true);
+    }
+    persistState();
+  }
+}
+
 function startMarketClock() {
   stopMarketClock();
   renderSessionInfo();
   state.clockTimer = window.setInterval(() => {
     renderSessionInfo();
     syncMarketSession();
+    handleEodAutoControls();
   }, 1000);
 }
 
@@ -941,6 +1137,7 @@ function reasonPill(value) {
     'TRAILING_SL': { label: 'TRAIL_SL_HIT', cls: 'trailing_sl' },
     'TARGET':      { label: 'TARGET',       cls: 'target' },
     'EOD':         { label: 'EOD',          cls: 'eod' },
+    'EOD_AUTO':    { label: 'EOD AUTO',     cls: 'eod' },
     'MANUAL':      { label: 'MANUAL',       cls: 'manual_exit' },
   };
   const entry = labelMap[String(value)] || { label: String(value || 'EOD'), cls: 'eod' };
@@ -1028,6 +1225,15 @@ function getSimulationLookbackMs(timeframe, confirmCandle) {
   const timeframeMs = timeframeToMs(timeframe);
   const barsNeeded = confirmCandle ? 3 : 2;
   return Math.max(90 * 1000, timeframeMs * barsNeeded);
+}
+
+function hashString(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index++) {
+    hash = ((hash << 5) - hash) + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
 }
 
 function round(value) {
