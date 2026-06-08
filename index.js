@@ -52,6 +52,8 @@ const state = {
   // EOD date guards – store the IST date string ('YYYY-MM-DD') when action was last taken
   eodExitDoneDate: null,
   eodStopDoneDate: null,
+  // Timestamp of the bar on which the last trade closed — new entries only allowed on LATER bars
+  simLastExitTs: null,
 };
 
 const els = {};
@@ -211,6 +213,7 @@ function startSimulation(options = {}) {
   state.simPosition = null;
   state.simTrades = [];
   state.simLastTs = null;
+  state.simLastExitTs = null;   // reset: no prior exit in this session
   state.lastTradeType = null;
   state.lastSavedTradeCount = 0;
   renderSimulation();
@@ -301,6 +304,16 @@ async function processBar(bar) {
 
   const signal = getEntrySignal(bar, state.simParams);
   if (!['CE', 'PE'].includes(signal)) return;
+
+  // ── Fresh-signal guard ─────────────────────────────────────────────────────
+  // Only enter on bars that arrived STRICTLY AFTER the bar on which the last
+  // trade closed. This prevents re-using the same (or earlier) candle's signal
+  // immediately after a SL / Target / Manual / EOD square-off.
+  if (state.simLastExitTs) {
+    const barTs      = asDate(bar.timestamp);
+    const lastExitTs = asDate(state.simLastExitTs);
+    if (barTs && lastExitTs && barTs <= lastExitTs) return;  // stale bar — skip
+  }
 
   // Alternation Logic: strictly alternate CE and PE trades
   if (state.lastTradeType && state.lastTradeType === signal) return;
@@ -406,6 +419,15 @@ async function closeActivePositionManually() {
 
 function completeTrade(exitPrice, exitTs, reason) {
   const trade = buildTrade(state.simPosition, exitPrice, exitTs, reason);
+  // Record the bar timestamp at which this trade closed so that processBar
+  // can refuse entry signals from that same bar or any earlier bar.
+  state.simLastExitTs = state.simPosition.entryTs;  // conservative: skip the ENTRY bar too
+  // If we have an explicit exitTs that is a valid bar timestamp, prefer it
+  const exitBarTs = asDate(exitTs);
+  const entryBarTs = asDate(state.simPosition.entryTs);
+  if (exitBarTs && entryBarTs && exitBarTs > entryBarTs) {
+    state.simLastExitTs = exitTs;
+  }
   state.simTrades.push(trade);
   state.lastTradeType = trade.type;
   state.simPosition = null;
