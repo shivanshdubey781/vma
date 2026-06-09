@@ -535,6 +535,17 @@ async function loadBackendActiveTrade() {
     if (!json.ok || !json.active_trade || !json.active_trade.position) return;
 
     const active = json.active_trade;
+    
+    // Check if the restored trade is from today in IST
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+    const tradeDate = asDate(active.opened_at || (active.position ? active.position.entryTs : null));
+    const tradeDateStr = tradeDate ? new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(tradeDate) : '';
+    
+    if (tradeDateStr !== todayStr) {
+      console.log('Ignoring stale backend active trade from previous day:', active.opened_at);
+      return;
+    }
+
     if (!state.simPosition) {
       state.simPosition = active.position;
       state.simParams = active.meta && active.meta.params ? active.meta.params : state.simParams;
@@ -653,14 +664,41 @@ function analyzeHistoryDecisions(history, simParams) {
 function resolveSimulationStartTime(simParams) {
   const history = state.dualData && Array.isArray(state.dualData.history) ? state.dualData.history : [];
   const analyzed = analyzeHistoryDecisions(history, simParams);
-  const latestEligible = analyzed.slice().reverse().find((bar) => bar.skipReason === 'Eligible');
+  const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+
+  // Find the latest eligible bar from TODAY
+  const latestEligible = analyzed.slice().reverse().find((bar) => {
+    if (bar.skipReason !== 'Eligible') return false;
+    const barDate = asDate(bar.timestamp);
+    if (!barDate) return false;
+    const barDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(barDate);
+    return barDateStr === todayStr;
+  });
 
   if (latestEligible && latestEligible.timestamp) {
     return latestEligible.timestamp;
   }
 
+  // Fallback to lookback, but clamp it to start of today's market session (09:16 IST)
   const lookbackMs = getSimulationLookbackMs(els.timeframe.value, simParams.confirmCandle);
-  return new Date(Date.now() - lookbackMs).toISOString();
+  const fallbackDate = new Date(Date.now() - lookbackMs);
+  
+  // Construct today's market start (09:16 IST)
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: INDIA_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = formatter.formatToParts(new Date());
+  const dateMap = parts.reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  const todayMarketStart = new Date(`${dateMap.year}-${dateMap.month}-${dateMap.day}T09:16:00+05:30`);
+
+  // Use the later of fallbackDate or todayMarketStart
+  return (fallbackDate > todayMarketStart ? fallbackDate : todayMarketStart).toISOString();
 }
 
 function getBarDecision(bar, simParams, lastAcceptedSignal) {
@@ -939,16 +977,40 @@ function restoreState() {
     if (saved.runtime) {
       state.tf = saved.runtime.tf || els.timeframe.value;
       state.dualData = saved.runtime.dualData || null;
-      state.simActive = saved.runtime.simActive || false;
-      state.simStartTime = saved.runtime.simStartTime || null;
-      state.simSessionId = saved.runtime.simSessionId || null;
       state.simParams = saved.runtime.simParams || null;
-      state.simPosition = saved.runtime.simPosition || null;
+      state.simSessionId = saved.runtime.simSessionId || null;
       state.simTrades = Array.isArray(saved.runtime.simTrades) ? saved.runtime.simTrades : [];
       state.simLastTs = saved.runtime.simLastTs || null;
       state.lastSavedTradeCount = saved.runtime.lastSavedTradeCount || 0;
       state.savedTrades = Array.isArray(saved.runtime.savedTrades) ? saved.runtime.savedTrades : [];
       state.manualSessionPause = Boolean(saved.runtime.manualSessionPause);
+
+      // Validate runtime properties against today's date in IST
+      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+      const savedStartTime = saved.runtime.simStartTime || null;
+      let isToday = false;
+      if (savedStartTime) {
+        const startDate = asDate(savedStartTime);
+        const startDateStr = startDate ? new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(startDate) : '';
+        isToday = (startDateStr === todayStr);
+      }
+
+      if (isToday) {
+        state.simActive = saved.runtime.simActive || false;
+        state.simStartTime = savedStartTime;
+        const pos = saved.runtime.simPosition || null;
+        if (pos && pos.entryTs) {
+          const posDate = asDate(pos.entryTs);
+          const posDateStr = posDate ? new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(posDate) : '';
+          state.simPosition = (posDateStr === todayStr) ? pos : null;
+        } else {
+          state.simPosition = null;
+        }
+      } else {
+        state.simActive = false;
+        state.simStartTime = null;
+        state.simPosition = null;
+      }
     }
   } catch (_) {
     localStorage.removeItem(STORAGE_KEY);

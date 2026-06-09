@@ -33,6 +33,7 @@ MONGO_URI = os.getenv("MONGO_URI", "").strip()
 DB_NAME = os.getenv("MONGO_DB", "trading_bot_db").strip() or "trading_bot_db"
 VMA_RESULTS_COLLECTION = "vma_results"
 VMA_TRADES_COLLECTION = "vma_trades"
+VMA_ACTIVE_TRADES_COLLECTION = "vma_active_trades"
 IST = timezone(timedelta(hours=5, minutes=30))
 COLLECTION_MAP = {
     "1min": "OHLC",
@@ -308,6 +309,15 @@ def ensure_vma_housekeeping():
         sparse=True,
         name="vma_trades_trade_key",
     )
+    db[VMA_ACTIVE_TRADES_COLLECTION].create_index(
+        [("session_id", ASCENDING)],
+        unique=True,
+        name="vma_active_trades_session_id",
+    )
+    db[VMA_ACTIVE_TRADES_COLLECTION].create_index(
+        [("updated_at", DESCENDING)],
+        name="vma_active_trades_updated_at",
+    )
     _mongo_housekeeping_ready = True
 
 
@@ -433,6 +443,66 @@ def fetch_saved_vma_trades(limit: int = 100) -> list[dict]:
     )
     docs.reverse()
     return docs
+
+
+def save_active_vma_trade(payload: dict) -> dict:
+    session_id = str(payload.get("session_id") or "").strip()
+    if not session_id:
+        raise ValueError("session_id is required")
+
+    status = str(payload.get("status") or "ACTIVE").upper()
+    if status not in {"ACTIVE", "CLOSED"}:
+        raise ValueError("status must be ACTIVE or CLOSED")
+
+    ensure_vma_housekeeping()
+    db = get_db()
+    now = datetime.utcnow()
+    document = {
+        "session_id": session_id,
+        "status": status,
+        "position": payload.get("position"),
+        "trade": payload.get("trade"),
+        "meta": payload.get("meta") or {},
+        "updated_at": now,
+        "source": "simulation_ui",
+    }
+    if status == "ACTIVE":
+        document["opened_at"] = payload.get("opened_at") or now
+    else:
+        document["closed_at"] = payload.get("closed_at") or now
+
+    db[VMA_ACTIVE_TRADES_COLLECTION].replace_one(
+        {"session_id": session_id},
+        document,
+        upsert=True,
+    )
+    return {"session_id": session_id, "status": status}
+
+
+def fetch_active_vma_trade() -> dict | None:
+    ensure_vma_housekeeping()
+    db = get_db()
+    trade = db[VMA_ACTIVE_TRADES_COLLECTION].find_one(
+        {"status": "ACTIVE"},
+        {"_id": 0},
+        sort=[("updated_at", DESCENDING)],
+    )
+    if trade:
+        opened_at = trade.get("opened_at")
+        if opened_at:
+            if isinstance(opened_at, str):
+                opened_at_dt = parse_timestamp(opened_at)
+            else:
+                opened_at_dt = opened_at
+
+            if opened_at_dt.tzinfo is None:
+                opened_at_dt = opened_at_dt.replace(tzinfo=timezone.utc)
+
+            opened_at_ist = opened_at_dt.astimezone(IST)
+            today_ist = datetime.now(IST).date()
+            if opened_at_ist.date() != today_ist:
+                return None
+    return trade
 
 
 def _pick_time_field(document: dict) -> str | None:
@@ -734,6 +804,13 @@ def compute_dual_vma(rows: list[dict], short_len: int = 9, long_len: int = 21) -
             else:
                 signal = "NONE"
 
+        price_above_vmas = r["close"] > max(sv, lv)
+        price_below_vmas = r["close"] < min(sv, lv)
+        if signal == "PE" and price_above_vmas and rsi > 55:
+            signal = "CE"
+        elif signal == "CE" and price_below_vmas and rsi < 45:
+            signal = "PE"
+
         # slopes (3-bar lookback)
         short_slope = round(sv - short_vals[i - 3], 4) if i >= 3 else 0.0
         long_slope  = round(lv - long_vals[i - 3], 4) if i >= 3 else 0.0
@@ -916,6 +993,29 @@ def api_vma_trades():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/vma-active-trade", methods=["GET", "POST"])
+def api_vma_active_trade():
+    if request.method == "GET":
+        try:
+            active_trade = fetch_active_vma_trade()
+            return jsonify({"ok": True, "active_trade": active_trade})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    payload = request.get_json(silent=True) or {}
+    status = str(payload.get("status") or "ACTIVE").upper()
+    if not isinstance(payload.get("position"), dict) and status == "ACTIVE":
+        return jsonify({"ok": False, "error": "position is required for ACTIVE status"}), 400
+
+    try:
+        summary = save_active_vma_trade(payload)
+        return jsonify({"ok": True, **summary})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/angel/option-ltp")
 def api_angel_option_ltp():
     side = request.args.get("side", "CE").upper()
@@ -1005,6 +1105,20 @@ def apply_cache_headers(response):
     elif request.path.startswith("/assets/"):
         response.headers["Cache-Control"] = "public, max-age=3600"
     return response
+
+
+@app.errorhandler(404)
+def not_found(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": f"API route not found: {request.path}"}), 404
+    return error
+
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": f"Method not allowed for API route: {request.path}"}), 405
+    return error
 
 
 HOST = os.getenv("API_HOST", "127.0.0.1")
