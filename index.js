@@ -589,10 +589,22 @@ async function loadSavedTrades() {
     state.savedTrades = json.trades || [];
     els.savedTradesMeta.textContent = (json.count || 0) + ' trades saved';
     if (state.savedTrades.length > 0) {
-      const validCompleted = state.savedTrades.filter(t => t.entryPrice != null && t.exitPrice != null && t.type);
-      if (validCompleted.length > 0) {
-        state.lastTradeType = validCompleted[validCompleted.length - 1].type;
-      }
+      // Only consider TODAY's completed trades for alternation so that
+      // yesterday's last trade does not block today's first signal.
+      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+      const validCompleted = state.savedTrades.filter((t) => {
+        if (t.entryPrice == null || t.exitPrice == null || !t.type) return false;
+        const tradeDate = asDate(t.entryTs);
+        const tradeDateStr = tradeDate
+          ? new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(tradeDate)
+          : '';
+        return tradeDateStr === todayStr;
+      });
+      // Update lastTradeType only if today has trades; reset to null otherwise
+      // so the first signal of the day is always eligible regardless of CE/PE.
+      state.lastTradeType = validCompleted.length > 0
+        ? validCompleted[validCompleted.length - 1].type
+        : null;
     }
     renderSavedTrades();
   } catch (error) {
