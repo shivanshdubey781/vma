@@ -335,6 +335,17 @@ def archive_expired_vma_results():
             ]
         }
     )
+    # Delete active trades older than today
+    db[VMA_ACTIVE_TRADES_COLLECTION].delete_many(
+        {
+            "$or": [
+                {"opened_at": {"$lt": start_of_today_ist_utc}},
+                {"updated_at": {"$lt": start_of_today_ist_utc}},
+            ]
+        }
+    )
+    # Delete any closed trades in active trades collection
+    db[VMA_ACTIVE_TRADES_COLLECTION].delete_many({"status": "CLOSED"})
 
 
 def prune_non_trade_vma_history():
@@ -456,6 +467,19 @@ def save_active_vma_trade(payload: dict) -> dict:
 
     ensure_vma_housekeeping()
     db = get_db()
+    
+    if status == "CLOSED":
+        # Delete this trade (and any other CLOSED ones) completely
+        db[VMA_ACTIVE_TRADES_COLLECTION].delete_many(
+            {"$or": [{"session_id": session_id}, {"status": "CLOSED"}]}
+        )
+        return {"session_id": session_id, "status": "CLOSED (DELETED)"}
+
+    # Delete all other active trades (so only one remains) and any CLOSED trades
+    db[VMA_ACTIVE_TRADES_COLLECTION].delete_many(
+        {"$or": [{"session_id": {"$ne": session_id}}, {"status": "CLOSED"}]}
+    )
+
     now = datetime.utcnow()
     document = {
         "session_id": session_id,
@@ -464,12 +488,9 @@ def save_active_vma_trade(payload: dict) -> dict:
         "trade": payload.get("trade"),
         "meta": payload.get("meta") or {},
         "updated_at": now,
+        "opened_at": payload.get("opened_at") or now,
         "source": "simulation_ui",
     }
-    if status == "ACTIVE":
-        document["opened_at"] = payload.get("opened_at") or now
-    else:
-        document["closed_at"] = payload.get("closed_at") or now
 
     db[VMA_ACTIVE_TRADES_COLLECTION].replace_one(
         {"session_id": session_id},
