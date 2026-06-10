@@ -549,13 +549,36 @@ async function loadBackendActiveTrade() {
     if (!state.simPosition) {
       state.simPosition = active.position;
       state.simParams = active.meta && active.meta.params ? active.meta.params : state.simParams;
-      state.simStartTime = active.meta && active.meta.started_at ? active.meta.started_at : state.simStartTime;
+
+      // ── Restore timeframe from backend so the correct API endpoint is polled ──
+      const restoredTf = active.meta && active.meta.timeframe ? active.meta.timeframe : null;
+      if (restoredTf) {
+        state.tf = restoredTf;
+        // Sync the timeframe selector so the dashboard also renders with the right TF
+        if (els.timeframe && els.timeframe.value !== restoredTf) {
+          els.timeframe.value = restoredTf;
+        }
+      }
+
+      // ── Ensure simStartTime is valid so pollAndProcess can compute newBars ──
+      // Prefer the stored started_at; fall back to today's market open (09:16 IST)
+      // so the bar filter `ts >= startTs` always has a non-null reference.
+      if (active.meta && active.meta.started_at) {
+        state.simStartTime = active.meta.started_at;
+      } else {
+        const todayIst = new Intl.DateTimeFormat('en-CA', { timeZone: INDIA_TIMEZONE }).format(new Date());
+        state.simStartTime = `${todayIst}T09:16:00+05:30`;
+      }
+
+      // Reset progress markers so updateOpenPosition picks up LIVE bars immediately
+      state.simLastTs = active.position ? active.position.entryTs : null;
+      state.simLastExitTs = null;
       state.simSessionId = active.session_id || state.simSessionId;
       state.simActive = true;
       startPolling();
       renderAll();
       persistState();
-      setStatus('Backend active simulation trade restored.', false, true);
+      setStatus('Backend active simulation trade restored — live price tracking resumed.', false, true);
     }
   } catch (error) {
     setStatus('Backend active trade sync failed: ' + error.message, true);
