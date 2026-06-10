@@ -917,19 +917,48 @@ def api_dual_vma():
         rows = fetch_closes(timeframe, limit=limit)
         data = compute_dual_vma(rows, short_len, long_len)
 
-        last = data[-1] if data else {}
-        prev = data[-2] if len(data) > 1 else last
+        # ── VMA Warm-up Filter ──────────────────────────────────────────────────
+        # compute_dual_vma runs over ALL fetched bars so the VMA is properly
+        # "warmed up" by historical data before the current session begins.
+        # We then restrict the history returned to the frontend to TODAY's IST
+        # bars only, so the signals visible on the dashboard match TradingView
+        # (which also has a full history warm-up).  Without this filter, the
+        # first 10-15 bars of the day would show incorrect/delayed signals
+        # because the VMA had not yet converged.
+        today_ist_str = datetime.now(IST).strftime("%Y-%m-%d")  # e.g. "2026-06-10"
 
-        # count crossover signals in full history
-        ce_signals = sum(1 for d in data if d["signal"] == "CE")
-        pe_signals = sum(1 for d in data if d["signal"] == "PE")
+        def _is_today_ist(ts_str) -> bool:
+            """Return True when the bar's timestamp falls on today (IST)."""
+            if not ts_str:
+                return False
+            ts = str(ts_str).strip()
+            # Fast path: most timestamps from MongoDB are "YYYY-MM-DD ..." or "YYYY-MM-DDTHH:..."
+            if ts.startswith(today_ist_str):
+                return True
+            # Slow path: full parse for ISO strings with timezone info
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                return dt.astimezone(IST).strftime("%Y-%m-%d") == today_ist_str
+            except Exception:
+                return False
+
+        today_data = [bar for bar in data if _is_today_ist(bar.get("timestamp"))]
+        # If no today bars found (e.g. weekend / testing), fall back to all data
+        history_data = today_data if today_data else data
+
+        last = history_data[-1] if history_data else (data[-1] if data else {})
+        prev = history_data[-2] if len(history_data) > 1 else last
+
+        # count crossover signals in today's history only
+        ce_signals = sum(1 for d in history_data if d["signal"] == "CE")
+        pe_signals = sum(1 for d in history_data if d["signal"] == "PE")
 
         response = {
             "ok":         True,
             "timeframe":  timeframe,
             "short_len":  short_len,
             "long_len":   long_len,
-            "total_bars": len(data),
+            "total_bars": len(history_data),
             "ce_signals": ce_signals,
             "pe_signals": pe_signals,
             "current": {
@@ -950,14 +979,14 @@ def api_dual_vma():
                 "is_sideways":    last.get("is_sideways"),
                 "quality":        last.get("quality"),
             },
-            "history": data,     # full history — JS sim engine needs all bars
+            "history": history_data,     # today's bars only — VMA already warmed up
         }
         save_vma_result_snapshot({
             "kind": "dual_vma",
             "timeframe": timeframe,
             "short_len": short_len,
             "long_len": long_len,
-            "total_bars": len(data),
+            "total_bars": len(history_data),
             "ce_signals": ce_signals,
             "pe_signals": pe_signals,
             "current": response["current"],
