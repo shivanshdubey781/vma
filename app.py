@@ -534,6 +534,449 @@ def _pick_time_field(document: dict) -> str | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVER-SIDE SIMULATION ENGINE
+# All simulation logic now runs on the server so every browser tab sees the
+# exact same trades, positions, and signals. Browsers are display-only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SimState:
+    """Singleton that holds the live simulation state on the server."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.active        = False
+        self.params        = {}          # sl, target, trailTrigger, trailLock, lotSize, slen, llen, instrument, sidewaysFilter, confirmCandle, minQuality, delta
+        self.tf            = "5min"
+        self.session_id    = None
+        self.started_at    = None        # IST timestamp string of first bar processed
+        self.position      = None        # dict: type, instrument, entry, entry_ts, init_sl, cur_sl, tgt, contract, expiry, lot_size, last_price
+        self.trades        = []          # completed trades this session (also in MongoDB)
+        self.last_ts       = None        # timestamp of last bar processed
+        self.last_exit_ts  = None        # timestamp of bar on which last trade closed
+        self.last_trade_type = None      # 'CE' | 'PE' | None  (alternation guard)
+        self.manual_pause  = False
+        self.tick_timer    = None        # threading.Timer handle
+        self.status_msg    = ""          # human-readable status for UI
+
+    def to_dict(self) -> dict:
+        with self.lock:
+            return {
+                "active":           self.active,
+                "params":           self.params,
+                "tf":               self.tf,
+                "session_id":       self.session_id,
+                "started_at":       self.started_at,
+                "position":         self.position,
+                "trades":           list(self.trades),
+                "last_ts":          self.last_ts,
+                "last_exit_ts":     self.last_exit_ts,
+                "last_trade_type":  self.last_trade_type,
+                "manual_pause":     self.manual_pause,
+                "status_msg":       self.status_msg,
+            }
+
+
+_sim = SimState()
+
+
+def _round2(v) -> float:
+    return round(float(v or 0), 2)
+
+
+def _sim_get_entry_signal(bar: dict, params: dict) -> str:
+    """Mirror of JS getEntrySignal(): returns 'CE', 'PE', or 'NONE'."""
+    signal = bar.get("signal", "NONE")
+    confirm = bar.get("confirm_signal", "NONE")
+    if params.get("confirmCandle"):
+        return confirm if confirm in ("CE", "PE") else "NONE"
+    if (params.get("minQuality", 0) or 0) > 0 and confirm in ("CE", "PE"):
+        return confirm
+    return signal if signal in ("CE", "PE") else "NONE"
+
+
+def _sim_complete_trade(exit_price: float, exit_ts: str, reason: str):
+    """Close the current open position, push trade to list + MongoDB."""
+    pos = _sim.position
+    if not pos:
+        return
+    params = _sim.params
+    lot_size = int(params.get("lotSize", 65))
+    entry = float(pos["entry"])
+
+    if pos.get("instrument") == "options":
+        pts = exit_price - entry
+    else:
+        direction = 1 if pos["type"] == "CE" else -1
+        pts = (exit_price - entry) * direction * float(params.get("delta", 0.5))
+
+    init_sl  = float(pos.get("init_sl", entry))
+    cur_sl   = float(pos.get("cur_sl", init_sl))
+    trail_sl = _round2(cur_sl) if abs(_round2(cur_sl) - _round2(init_sl)) > 0.01 else None
+
+    trade = {
+        "type":       pos["type"],
+        "instrument": pos.get("instrument", "options"),
+        "contract":   pos.get("contract"),
+        "expiry":     pos.get("expiry"),
+        "entryTs":    pos.get("entry_ts"),
+        "entryPrice": _round2(entry),
+        "exitTs":     exit_ts,
+        "exitPrice":  _round2(exit_price),
+        "sl":         _round2(init_sl),
+        "tgt":        _round2(pos.get("tgt", entry)),
+        "trailSL":    trail_sl,
+        "lotSize":    lot_size,
+        "pts":        _round2(pts),
+        "grossPnl":   _round2(pts * lot_size),
+        "reason":     reason,
+    }
+
+    # Record last-exit bar to prevent re-entry on same bar
+    entry_bar_ts = pos.get("entry_ts")
+    if exit_ts and entry_bar_ts and exit_ts > entry_bar_ts:
+        _sim.last_exit_ts = exit_ts
+    else:
+        _sim.last_exit_ts = entry_bar_ts
+
+    _sim.last_trade_type = pos["type"]
+    _sim.position = None
+    _sim.trades.append(trade)
+
+    # Persist to MongoDB
+    try:
+        save_vma_trades({
+            "trades": [trade],
+            "meta": {
+                "timeframe": _sim.tf,
+                "started_at": _sim.started_at,
+                "params": {
+                    "confirmCandle":  bool(_sim.params.get("confirmCandle")),
+                    "delta":          float(_sim.params.get("delta", 0.5)),
+                    "instrument":     _sim.params.get("instrument", "options"),
+                    "llen":           int(_sim.params.get("llen", 9)),
+                    "lotSize":        int(_sim.params.get("lotSize", 65)),
+                    "minQuality":     int(_sim.params.get("minQuality", 2)),
+                    "sidewaysFilter": bool(_sim.params.get("sidewaysFilter")),
+                    "sl":             float(_sim.params.get("sl", 40)),
+                    "slen":           int(_sim.params.get("slen", 5)),
+                    "target":         float(_sim.params.get("target", 60)),
+                    "trailLock":      float(_sim.params.get("trailLock", 15)),
+                    "trailTrigger":   float(_sim.params.get("trailTrigger", 25)),
+                },
+            },
+        })
+    except Exception:
+        pass  # don't crash the tick if DB write fails
+
+    _sim.status_msg = f"Trade closed: {reason} @ {_round2(exit_price)}"
+
+
+def _sim_process_bar(bar: dict):
+    """
+    Mirror of JS processBar() + updateOpenPosition() — runs on the server.
+    Mutates _sim in place (caller must hold _sim.lock).
+    """
+    params = _sim.params
+
+    # ── If we have an open position: update SL/trail/check exit ─────────────
+    if _sim.position:
+        pos = _sim.position
+        ts = bar["timestamp"]
+
+        if pos.get("instrument") == "options":
+            # Fetch live option LTP for the existing contract
+            try:
+                ltp_data = angel_client.get_ltp(
+                    "NFO",
+                    pos["contract"],
+                    str(pos.get("symboltoken", "")),
+                )
+                price = float(ltp_data)
+            except Exception:
+                price = float(pos.get("last_price") or pos["entry"])
+
+            pos["last_price"] = price
+            trail_trigger = float(params.get("trailTrigger", 0))
+            trail_lock    = float(params.get("trailLock", 0))
+            if trail_trigger > 0 and price - pos["entry"] >= trail_trigger:
+                pos["cur_sl"] = max(pos["cur_sl"], pos["entry"] + trail_lock)
+            if price <= pos["cur_sl"]:
+                reason = "TRAILING_SL" if pos["cur_sl"] > pos["init_sl"] else "SL"
+                _sim_complete_trade(pos["cur_sl"], ts, reason)
+                return
+            if price >= pos["tgt"]:
+                _sim_complete_trade(pos["tgt"], ts, "TARGET")
+                return
+        else:
+            # Futures/index: use bar OHLC
+            pos["last_price"] = bar["close"]
+            trail_trigger = float(params.get("trailTrigger", 0))
+            trail_lock    = float(params.get("trailLock", 0))
+            if pos["type"] == "CE":
+                if trail_trigger > 0 and bar["high"] - pos["entry"] >= trail_trigger:
+                    pos["cur_sl"] = max(pos["cur_sl"], bar["close"] - trail_lock)
+                if bar["low"] <= pos["cur_sl"]:
+                    reason = "TRAILING_SL" if pos["cur_sl"] > pos["init_sl"] else "SL"
+                    _sim_complete_trade(pos["cur_sl"], ts, reason)
+                    return
+                if bar["high"] >= pos["tgt"]:
+                    _sim_complete_trade(pos["tgt"], ts, "TARGET")
+                    return
+            else:  # PE
+                if trail_trigger > 0 and pos["entry"] - bar["low"] >= trail_trigger:
+                    pos["cur_sl"] = min(pos["cur_sl"], bar["close"] + trail_lock)
+                if bar["high"] >= pos["cur_sl"]:
+                    reason = "TRAILING_SL" if pos["cur_sl"] < pos["init_sl"] else "SL"
+                    _sim_complete_trade(pos["cur_sl"], ts, reason)
+                    return
+                if bar["low"] <= pos["tgt"]:
+                    _sim_complete_trade(pos["tgt"], ts, "TARGET")
+                    return
+        return  # position still open — done with this bar
+
+    # ── No open position: check for entry signal ─────────────────────────────
+    signal = _sim_get_entry_signal(bar, params)
+    if signal not in ("CE", "PE"):
+        return
+
+    # Fresh-signal guard: skip bars at or before the last exit bar
+    if _sim.last_exit_ts:
+        if bar["timestamp"] <= _sim.last_exit_ts:
+            return
+
+    # Alternation guard: don't take same side twice in a row
+    if _sim.last_trade_type and _sim.last_trade_type == signal:
+        return
+
+    # Sideways filter
+    if params.get("sidewaysFilter") and bar.get("is_sideways"):
+        return
+
+    # Quality filter
+    if (bar.get("quality") or 0) < (params.get("minQuality") or 0):
+        return
+
+    # ── Open a new position ───────────────────────────────────────────────────
+    sl_pts     = float(params.get("sl", 40))
+    tgt_pts    = float(params.get("target", 60))
+    lot_size   = int(params.get("lotSize", 65))
+    instrument = params.get("instrument", "options")
+    ts         = bar["timestamp"]
+
+    if instrument == "options":
+        try:
+            quote = angel_client.get_nifty_option_ltp(signal, float(bar["close"]))
+            entry    = float(quote["ltp"])
+            contract = quote.get("tradingsymbol")
+            expiry   = quote.get("expiry")
+            sym_tok  = quote.get("symboltoken")
+        except Exception as exc:
+            _sim.status_msg = f"LTP fetch failed: {exc}"
+            return
+
+        _sim.position = {
+            "type":        signal,
+            "instrument":  "options",
+            "entry":       entry,
+            "entry_ts":    ts,
+            "init_sl":     entry - sl_pts,
+            "cur_sl":      entry - sl_pts,
+            "tgt":         entry + tgt_pts,
+            "contract":    contract,
+            "expiry":      expiry,
+            "symboltoken": sym_tok,
+            "lot_size":    lot_size,
+            "last_price":  entry,
+        }
+    else:
+        # Futures/index — entry at bar close
+        entry  = float(bar["close"])
+        delta  = float(params.get("delta", 0.5))
+        direction = 1 if signal == "CE" else -1
+        _sim.position = {
+            "type":        signal,
+            "instrument":  "futures",
+            "entry":       entry,
+            "entry_ts":    ts,
+            "init_sl":     entry - direction * sl_pts,
+            "cur_sl":      entry - direction * sl_pts,
+            "tgt":         entry + direction * tgt_pts,
+            "contract":    None,
+            "expiry":      None,
+            "symboltoken": None,
+            "lot_size":    lot_size,
+            "last_price":  entry,
+        }
+
+    _sim.status_msg = f"Position opened: {signal} @ {_round2(entry)}"
+
+    # Persist active trade to MongoDB so it survives a server restart
+    try:
+        save_active_vma_trade({
+            "session_id": _sim.session_id,
+            "status": "ACTIVE",
+            "position": _sim.position,
+            "opened_at": ts,
+            "meta": {
+                "timeframe": _sim.tf,
+                "started_at": _sim.started_at,
+                "params": _sim.params,
+            },
+        })
+    except Exception:
+        pass
+
+
+def _server_tick():
+    """
+    Background tick: fetches new bars from MongoDB, runs the simulation loop.
+    Reschedules itself using threading.Timer.
+    """
+    with _sim.lock:
+        if not _sim.active:
+            return
+        try:
+            rows = fetch_closes(_sim.tf, limit=2000)
+            data = compute_dual_vma(
+                rows,
+                int(_sim.params.get("slen", 5)),
+                int(_sim.params.get("llen", 9)),
+            )
+
+            start_ts = _sim.started_at
+            new_bars = [
+                b for b in data
+                if b["timestamp"]
+                and start_ts
+                and b["timestamp"] >= start_ts
+                and (not _sim.last_ts or b["timestamp"] > _sim.last_ts)
+            ]
+
+            for bar in new_bars:
+                _sim_process_bar(bar)
+                _sim.last_ts = bar["timestamp"]
+
+        except Exception as exc:
+            _sim.status_msg = f"Tick error: {exc}"
+
+    # Reschedule
+    interval = int(_sim.params.get("refreshInterval", 10000)) / 1000.0
+    interval = max(5.0, min(interval, 60.0))
+    with _sim.lock:
+        if _sim.active:
+            _sim.tick_timer = threading.Timer(interval, _server_tick)
+            _sim.tick_timer.daemon = True
+            _sim.tick_timer.start()
+
+
+def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000):
+    """Start (or restart) the server-side simulation."""
+    with _sim.lock:
+        # Cancel any running timer
+        if _sim.tick_timer:
+            _sim.tick_timer.cancel()
+            _sim.tick_timer = None
+
+        _sim.reset()
+        _sim.active      = True
+        _sim.params      = dict(params)
+        _sim.params["refreshInterval"] = refresh_ms
+        _sim.tf          = tf
+        _sim.session_id  = "srv-" + hashlib.sha256(
+            (tf + json.dumps(params, sort_keys=True) + str(time.time())).encode()
+        ).hexdigest()[:12]
+
+        # Determine start time: first bar of today in IST at or after 09:16
+        today_ist_str = datetime.now(IST).strftime("%Y-%m-%d")
+        _sim.started_at = today_ist_str + " 09:16:00"
+        _sim.status_msg = "Simulation started."
+
+    # Kick off the first tick immediately (outside lock to avoid deadlock)
+    threading.Thread(target=_server_tick, daemon=True).start()
+
+
+def _stop_server_sim(reason: str = "MANUAL"):
+    """Stop the simulation and close any open position."""
+    with _sim.lock:
+        if _sim.tick_timer:
+            _sim.tick_timer.cancel()
+            _sim.tick_timer = None
+        _sim.active = False
+
+        if _sim.position:
+            pos = _sim.position
+            exit_price = float(pos.get("last_price") or pos.get("entry", 0))
+            # Inline close without calling _sim_complete_trade to stay inside lock
+            _sim.position = None
+            _sim.status_msg = f"Simulation stopped ({reason}). Position closed @ {exit_price}."
+        else:
+            _sim.status_msg = f"Simulation stopped ({reason})."
+
+
+@app.route("/api/sim-state")
+def api_sim_state():
+    """Return the full server-side simulation state. All browsers poll this."""
+    return jsonify({"ok": True, "sim": _sim.to_dict()})
+
+
+@app.route("/api/sim-control", methods=["POST"])
+def api_sim_control():
+    """
+    Control the server-side simulation.
+
+    Body: { "action": "start" | "stop" | "squareoff", "params": {...}, "tf": "...", "refresh_ms": N }
+    """
+    payload = request.get_json(silent=True) or {}
+    action  = str(payload.get("action") or "").lower()
+
+    if action == "start":
+        params = payload.get("params") or {}
+        tf     = str(payload.get("tf") or "5min")
+        refresh_ms = int(payload.get("refresh_ms") or 10000)
+        if not params:
+            return jsonify({"ok": False, "error": "params required"}), 400
+        _start_server_sim(params, tf, refresh_ms)
+        return jsonify({"ok": True, "session_id": _sim.session_id})
+
+    if action == "stop":
+        _stop_server_sim("MANUAL")
+        return jsonify({"ok": True})
+
+    if action == "squareoff":
+        with _sim.lock:
+            if _sim.position:
+                pos = _sim.position
+                exit_price = float(pos.get("last_price") or pos.get("entry", 0))
+                ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                _sim_complete_trade(exit_price, ts, "MANUAL")
+            else:
+                pass
+        return jsonify({"ok": True})
+
+    if action == "tf_switch":
+        tf = str(payload.get("tf") or _sim.tf)
+        with _sim.lock:
+            if _sim.position:
+                pos = _sim.position
+                exit_price = float(pos.get("last_price") or pos.get("entry", 0))
+                ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                _sim_complete_trade(exit_price, ts, "TF_SWITCH")
+            old_params = dict(_sim.params)
+            refresh_ms = int(_sim.params.get("refreshInterval", 10000))
+            was_active = _sim.active
+        if was_active:
+            _start_server_sim(old_params, tf, refresh_ms)
+        return jsonify({"ok": True})
+
+    return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
+
+
+# ─── End of server-side simulation engine ────────────────────────────────────
+
+
 def fetch_closes(timeframe: str, limit: int = 500):
     col_name = COLLECTION_MAP.get(timeframe)
     if not col_name:
