@@ -889,9 +889,14 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000):
             (tf + json.dumps(params, sort_keys=True) + str(time.time())).encode()
         ).hexdigest()[:12]
 
-        # Determine start time: first bar of today in IST at or after 09:16
-        today_ist_str = datetime.now(IST).strftime("%Y-%m-%d")
-        _sim.started_at = today_ist_str + " 09:16:00"
+        # ── started_at = NOW (current IST bar timestamp), not 09:16 ─────────────
+        # Using 09:16 caused the sim to replay all historical bars from market
+        # open on every start / TF-switch / restart, entering stale trades
+        # (e.g. a 09:21 bar CE traded at 1:40 PM after a TF switch).
+        # By anchoring to the current minute we guarantee only candles that
+        # form AFTER the sim is (re)started can generate entries.
+        now_ist = datetime.now(IST)
+        _sim.started_at = now_ist.strftime("%Y-%m-%d %H:%M:%S")
         _sim.status_msg = "Simulation started."
 
     # Kick off the first tick immediately (outside lock to avoid deadlock)
