@@ -25,6 +25,8 @@ const state = {
   historyPageSize: 15,
   tradesPage:     1,
   tradesPageSize: 10,
+  // Anti-spam guard: last time we fired a syncMarketSession auto-start
+  _lastAutoStartMs: 0,
 };
 
 const els = {};
@@ -247,11 +249,27 @@ async function handleTimeframeChange() {
 // ─────────────────────────────────────────────────────────────────────────────
 function syncMarketSession(isInitial = false) {
   const session = getMarketSessionState();
-  // If server sim is not active and market is open and we're not paused, auto-start
   const sim = state.sim;
+
+  // Only attempt auto-start if:
+  //   1. We have already heard back from the server (sim !== null)
+  //   2. The server confirms it is NOT running
+  //   3. Market is open and user has not manually paused
+  //   4. At least 60 seconds have passed since the last auto-start attempt
+  //      (prevents 1-per-second spam that resets the sim on every tick)
   const serverActive = sim && sim.active;
   const manualPause  = sim && sim.manual_pause;
-  if (session.isOpen && !serverActive && !manualPause) {
+  const nowMs        = Date.now();
+  const cooldownMs   = 60_000;  // 60 s between auto-start attempts
+
+  if (
+    sim !== null &&          // server state known
+    session.isOpen &&        // market is open
+    !serverActive &&         // server not already running
+    !manualPause &&          // user did not manually pause
+    (nowMs - state._lastAutoStartMs) > cooldownMs
+  ) {
+    state._lastAutoStartMs = nowMs;
     sendSimControl('start').catch(() => {});
   }
   renderSessionInfo(session);

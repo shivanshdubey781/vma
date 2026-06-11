@@ -899,21 +899,87 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000):
 
 
 def _stop_server_sim(reason: str = "MANUAL"):
-    """Stop the simulation and close any open position."""
+    """Stop the simulation, properly closing any open position first."""
+    # ── Step 1: capture the open position OUTSIDE the main op so we can call
+    #            _sim_complete_trade (which itself mutates _sim) safely.
     with _sim.lock:
         if _sim.tick_timer:
             _sim.tick_timer.cancel()
             _sim.tick_timer = None
         _sim.active = False
+        has_position = bool(_sim.position)
 
-        if _sim.position:
-            pos = _sim.position
-            exit_price = float(pos.get("last_price") or pos.get("entry", 0))
-            # Inline close without calling _sim_complete_trade to stay inside lock
-            _sim.position = None
-            _sim.status_msg = f"Simulation stopped ({reason}). Position closed @ {exit_price}."
-        else:
-            _sim.status_msg = f"Simulation stopped ({reason})."
+    # ── Step 2: if there was an open position, close it properly so it is
+    #            saved to MongoDB (Bug 2 fix — was silently lost before).
+    if has_position:
+        ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        with _sim.lock:
+            _sim_complete_trade(
+                float(_sim.position.get("last_price") or _sim.position.get("entry", 0)),
+                ts,
+                reason,
+            ) if _sim.position else None
+        _sim.status_msg = f"Simulation stopped ({reason}). Open position closed and saved."
+    else:
+        _sim.status_msg = f"Simulation stopped ({reason})."
+
+
+def restore_sim_from_db():
+    """
+    Called once at server startup (Bug 3 fix).
+    If there is an ACTIVE trade document in MongoDB that was opened today,
+    re-hydrate _sim so the server continues managing the position without
+    needing the browser to restart the simulation.
+    """
+    try:
+        trade_doc = fetch_active_vma_trade()   # returns None if stale/missing
+        if not trade_doc:
+            return
+        pos  = trade_doc.get("position")
+        meta = trade_doc.get("meta") or {}
+        if not pos:
+            return
+
+        with _sim.lock:
+            if _sim.active:        # already running — don't clobber
+                return
+            _sim.active      = True
+            _sim.position    = pos
+            _sim.params      = meta.get("params") or {}
+            _sim.tf          = meta.get("timeframe") or "5min"
+            _sim.started_at  = meta.get("started_at") or (
+                datetime.now(IST).strftime("%Y-%m-%d") + " 09:16:00"
+            )
+            _sim.session_id  = trade_doc.get("session_id") or (
+                "restore-" + hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
+            )
+            _sim.last_ts     = pos.get("entry_ts")   # so tick starts after entry bar
+            _sim.last_exit_ts = None
+            _sim.status_msg  = "Position restored after server restart."
+
+        # Start ticking again immediately
+        threading.Thread(target=_server_tick, daemon=True).start()
+        print(f"[VMA] Restored active trade from DB: {pos.get('type')} @ {pos.get('entry')}")
+    except Exception as exc:
+        print(f"[VMA] restore_sim_from_db failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server-startup hook: restore sim from DB on first request (Gunicorn restart
+# recovery). We use an _startup_done flag + lock so it only runs once even
+# with multiple workers (both workers will race, but the second will see _sim.active).
+_startup_done = False
+_startup_lock = threading.Lock()
+
+@app.before_request
+def _on_first_request():
+    global _startup_done
+    if _startup_done:
+        return
+    with _startup_lock:
+        if not _startup_done:
+            _startup_done = True
+            restore_sim_from_db()
 
 
 @app.route("/api/sim-state")
@@ -933,13 +999,29 @@ def api_sim_control():
     action  = str(payload.get("action") or "").lower()
 
     if action == "start":
-        params = payload.get("params") or {}
-        tf     = str(payload.get("tf") or "5min")
+        params     = payload.get("params") or {}
+        tf         = str(payload.get("tf") or "5min")
         refresh_ms = int(payload.get("refresh_ms") or 10000)
         if not params:
             return jsonify({"ok": False, "error": "params required"}), 400
+
+        # ── Idempotency guard: if the sim is already running with the same tf,
+        #    just return success without resetting state (Bug 4 fix).
+        with _sim.lock:
+            already_active = (
+                _sim.active
+                and _sim.tf == tf
+                and _sim.params.get("sl") == params.get("sl")
+                and _sim.params.get("target") == params.get("target")
+                and _sim.params.get("instrument") == params.get("instrument")
+            )
+            current_session = _sim.session_id
+        if already_active:
+            return jsonify({"ok": True, "session_id": current_session, "noop": True})
+
         _start_server_sim(params, tf, refresh_ms)
         return jsonify({"ok": True, "session_id": _sim.session_id})
+
 
     if action == "stop":
         _stop_server_sim("MANUAL")
