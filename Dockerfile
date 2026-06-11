@@ -11,4 +11,4 @@ EXPOSE 8012
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8012", "--workers", "2", "--threads", "4", "main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8012", "--workers", "1", "--threads", "8", "--timeout", "120", "main:app"]
