@@ -1355,12 +1355,8 @@ def compute_dual_vma(rows: list[dict], short_len: int = 9, long_len: int = 21) -
             else:
                 signal = "NONE"
 
-        price_above_vmas = r["close"] > max(sv, lv)
-        price_below_vmas = r["close"] < min(sv, lv)
-        if signal == "PE" and price_above_vmas and rsi > 55:
-            signal = "CE"
-        elif signal == "CE" and price_below_vmas and rsi < 45:
-            signal = "PE"
+        # Note: Price-vs-VMA override removed — flipping crossover signals based
+        # on instantaneous price position produced incorrect CE/PE on fast timeframes.
 
         # slopes (3-bar lookback)
         short_slope = round(sv - short_vals[i - 3], 4) if i >= 3 else 0.0
