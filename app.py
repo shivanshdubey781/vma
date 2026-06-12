@@ -335,14 +335,12 @@ def archive_expired_vma_results():
             ]
         }
     )
-    # Delete active trades older than today
+    # Delete active trades older than today.
+    # Only compare against updated_at (a real UTC datetime stored by the server).
+    # opened_at can be a plain IST string set by the sim, which MongoDB cannot
+    # compare against a datetime — so we exclude it from this filter.
     db[VMA_ACTIVE_TRADES_COLLECTION].delete_many(
-        {
-            "$or": [
-                {"opened_at": {"$lt": start_of_today_ist_utc}},
-                {"updated_at": {"$lt": start_of_today_ist_utc}},
-            ]
-        }
+        {"updated_at": {"$lt": start_of_today_ist_utc}}
     )
     # Delete any closed trades in active trades collection
     db[VMA_ACTIVE_TRADES_COLLECTION].delete_many({"status": "CLOSED"})
@@ -512,18 +510,41 @@ def fetch_active_vma_trade() -> dict | None:
         opened_at = trade.get("opened_at")
         if opened_at:
             if isinstance(opened_at, str):
-                opened_at_dt = parse_timestamp(opened_at)
+                # Strings stored by the sim are naive IST (e.g. "2026-06-12 10:00:00").
+                # Attach IST timezone explicitly — do NOT use UTC.
+                opened_at_dt = parse_timestamp(opened_at).replace(tzinfo=IST)
             else:
-                opened_at_dt = opened_at
-
-            if opened_at_dt.tzinfo is None:
-                opened_at_dt = opened_at_dt.replace(tzinfo=timezone.utc)
+                # datetime objects from MongoDB are UTC-naive; attach UTC.
+                opened_at_dt = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
 
             opened_at_ist = opened_at_dt.astimezone(IST)
             today_ist = datetime.now(IST).date()
             if opened_at_ist.date() != today_ist:
                 return None
     return trade
+
+
+def parse_timestamp(value: str) -> datetime:
+    """
+    Parse a timestamp string into a naive datetime object.
+    Handles ISO-8601 with/without fractional seconds and
+    simple 'YYYY-MM-DD HH:MM:SS' strings (treated as naive local/IST).
+    """
+    if not value:
+        raise ValueError("Empty timestamp string")
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(value.split("+")[0].split("Z")[0].strip(), fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognised timestamp format: {value!r}")
 
 
 def _pick_time_field(document: dict) -> str | None:
@@ -782,6 +803,7 @@ def _sim_process_bar(bar: dict):
             "instrument":  "options",
             "entry":       entry,
             "entry_ts":    ts,
+            "entry_tf":    _sim.tf,      # TF that generated the entry signal
             "init_sl":     entry - sl_pts,
             "cur_sl":      entry - sl_pts,
             "tgt":         entry + tgt_pts,
@@ -801,6 +823,7 @@ def _sim_process_bar(bar: dict):
             "instrument":  "futures",
             "entry":       entry,
             "entry_ts":    ts,
+            "entry_tf":    _sim.tf,      # TF that generated the entry signal
             "init_sl":     entry - direction * sl_pts,
             "cur_sl":      entry - direction * sl_pts,
             "tgt":         entry + direction * tgt_pts,
@@ -872,8 +895,15 @@ def _server_tick():
             _sim.tick_timer.start()
 
 
-def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000):
-    """Start (or restart) the server-side simulation."""
+def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
+                      carry_position: dict | None = None):
+    """
+    Start (or restart) the server-side simulation.
+
+    carry_position: when provided (e.g. on a TF switch) the existing open
+    position is preserved into the new sim state instead of being discarded.
+    The position will continue to be managed by the tick loop under the new TF.
+    """
     with _sim.lock:
         # Cancel any running timer
         if _sim.tick_timer:
@@ -897,7 +927,23 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000):
         # form AFTER the sim is (re)started can generate entries.
         now_ist = datetime.now(IST)
         _sim.started_at = now_ist.strftime("%Y-%m-%d %H:%M:%S")
-        _sim.status_msg = "Simulation started."
+
+        if carry_position:
+            # Re-inject the position that was open before the TF switch.
+            # Keep its original entry / SL / target untouched; only the
+            # signal-generation timeframe changes.  The tick loop will
+            # keep fetching live LTP and enforcing SL/target as before.
+            _sim.position   = carry_position
+            # Set last_ts to the position's entry bar so the new-bars filter
+            # in _server_tick doesn't replay bars before the entry.
+            _sim.last_ts    = carry_position.get("entry_ts")
+            _sim.status_msg = (
+                f"TF switched to {tf}. Existing "
+                f"{carry_position.get('type')} position carried forward "
+                f"(entry @ {carry_position.get('entry')})."
+            )
+        else:
+            _sim.status_msg = "Simulation started."
 
     # Kick off the first tick immediately (outside lock to avoid deadlock)
     threading.Thread(target=_server_tick, daemon=True).start()
@@ -1046,17 +1092,17 @@ def api_sim_control():
     if action == "tf_switch":
         tf = str(payload.get("tf") or _sim.tf)
         with _sim.lock:
-            if _sim.position:
-                pos = _sim.position
-                exit_price = float(pos.get("last_price") or pos.get("entry", 0))
-                ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-                _sim_complete_trade(exit_price, ts, "TF_SWITCH")
-            old_params = dict(_sim.params)
-            refresh_ms = int(_sim.params.get("refreshInterval", 10000))
-            was_active = _sim.active
+            # Snapshot the open position (if any) so we can carry it forward.
+            # We intentionally do NOT square it off — the user only changed the
+            # signal-generation timeframe; the existing trade should keep running
+            # under its original entry / SL / target until it closes naturally.
+            open_position = dict(_sim.position) if _sim.position else None
+            old_params    = dict(_sim.params)
+            refresh_ms    = int(_sim.params.get("refreshInterval", 10000))
+            was_active    = _sim.active
         if was_active:
-            _start_server_sim(old_params, tf, refresh_ms)
-        return jsonify({"ok": True})
+            _start_server_sim(old_params, tf, refresh_ms, carry_position=open_position)
+        return jsonify({"ok": True, "carried_position": bool(open_position)})
 
     return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
 

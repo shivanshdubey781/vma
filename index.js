@@ -375,6 +375,10 @@ function renderActivePosition() {
   const last  = parseFloat(pos.last_price || entry);
   const lotSize = parseInt((sim.params && sim.params.lotSize) || pos.lot_size || 65, 10);
   const unrealized = (last - entry) * lotSize;
+  // entry_tf is stamped onto the position when it's opened; falls back to current tf.
+  const entryTf = pos.entry_tf || sim.tf || '-';
+  const currentTf = sim.tf || '-';
+  const tfLabel = entryTf !== currentTf ? `${entryTf} → ${currentTf}` : entryTf;
   els.activeTradeGrid.innerHTML = [
     cell('Type',       pos.type),
     cell('Instrument', pos.instrument),
@@ -383,6 +387,7 @@ function renderActivePosition() {
     cell('SL',         formatNumber(pos.cur_sl)),
     cell('Target',     formatNumber(pos.tgt)),
     cell('Contract',   pos.contract || '-'),
+    cell('TF',         tfLabel),
     cell('Unrealized', formatCurrency(unrealized), unrealized >= 0 ? 'positive' : 'negative'),
   ].join('');
 }
@@ -682,7 +687,7 @@ function signalPill(value) {
   return '<span class="signal-pill ' + n + '">' + escapeHtml(String(value || 'NONE')) + '</span>';
 }
 function reasonPill(value) {
-  const m = { 'SL': { label: 'SL_HIT', cls: 'sl' }, 'TRAILING_SL': { label: 'TRAIL_SL_HIT', cls: 'trailing_sl' }, 'TARGET': { label: 'TARGET', cls: 'target' }, 'EOD': { label: 'EOD', cls: 'eod' }, 'EOD_AUTO': { label: 'EOD AUTO', cls: 'eod' }, 'MANUAL': { label: 'MANUAL', cls: 'manual_exit' }, 'TF_SWITCH': { label: 'TF SWITCH', cls: 'eod' } };
+  const m = { 'SL': { label: 'SL_HIT', cls: 'sl' }, 'TRAILING_SL': { label: 'TRAIL_SL_HIT', cls: 'trailing_sl' }, 'TARGET': { label: 'TARGET', cls: 'target' }, 'EOD': { label: 'EOD', cls: 'eod' }, 'EOD_AUTO': { label: 'EOD AUTO', cls: 'eod' }, 'MANUAL': { label: 'MANUAL', cls: 'manual_exit' } };
   const e = m[String(value)] || { label: String(value || 'EOD'), cls: 'eod' };
   return '<span class="reason-pill ' + e.cls + '">' + escapeHtml(e.label) + '</span>';
 }
