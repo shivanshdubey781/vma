@@ -919,25 +919,29 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
             (tf + json.dumps(params, sort_keys=True) + str(time.time())).encode()
         ).hexdigest()[:12]
 
-        # ── started_at = floor of current candle open (NOT exact now) ──────────
-        # Using 09:16 caused the sim to replay all historical bars from market
-        # open on every start / TF-switch / restart, entering stale trades
-        # (e.g. a 09:21 bar CE traded at 1:40 PM after a TF switch).
+        # ── started_at: market-open anchor in the morning, candle-floor mid-day ──
         #
-        # Using exact now (HH:MM:SS) caused a different bug: if the sim starts
-        # at e.g. 10:40:32 on a 3-min TF, the most-recently-completed candle
-        # (10:39:00) would be filtered out because "10:39:00" < "10:40:32",
-        # making the sim miss a valid eligible trade signal on that bar.
+        # Problem: if the user clicks Start at e.g. 9:21 on a 3-min TF, the
+        # candle-floor gives started_at = "09:21:00".  The morning crossover
+        # (9:15 bar) AND its confirm bar (9:18 bar) are both < "09:21:00" and
+        # get filtered out → first trade of the day is permanently missed.
         #
-        # Fix: floor now to the start of the current candle interval so that
-        # started_at == the current candle's open timestamp. This captures the
-        # live candle (and any signal on the candle that just closed) while
-        # still preventing replay of old historical bars.
+        # Fix: during the morning session (before 10:30 IST) always anchor
+        # started_at to market open (09:15:00) so every bar from the first
+        # candle onwards is eligible.  After 10:30 we fall back to the
+        # candle-floor approach to prevent stale-signal replay on mid-day
+        # restarts / TF-switches.
         now_ist = datetime.now(IST)
         tf_minutes = {"1min": 1, "3min": 3, "5min": 5, "15min": 15}.get(tf, 3)
-        floored_minute = (now_ist.minute // tf_minutes) * tf_minutes
-        candle_open = now_ist.replace(minute=floored_minute, second=0, microsecond=0)
-        _sim.started_at = candle_open.strftime("%Y-%m-%d %H:%M:%S")
+        market_open_cutoff = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
+        if now_ist <= market_open_cutoff:
+            # Morning session: anchor to 09:15 so we never miss the first bar
+            _sim.started_at = now_ist.strftime("%Y-%m-%d") + " 09:15:00"
+        else:
+            # Mid-day: floor to the current candle to avoid stale trade replay
+            floored_minute = (now_ist.minute // tf_minutes) * tf_minutes
+            candle_open = now_ist.replace(minute=floored_minute, second=0, microsecond=0)
+            _sim.started_at = candle_open.strftime("%Y-%m-%d %H:%M:%S")
 
         if carry_position:
             # Re-inject the position that was open before the TF switch.
