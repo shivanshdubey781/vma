@@ -919,14 +919,25 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
             (tf + json.dumps(params, sort_keys=True) + str(time.time())).encode()
         ).hexdigest()[:12]
 
-        # ── started_at = NOW (current IST bar timestamp), not 09:16 ─────────────
+        # ── started_at = floor of current candle open (NOT exact now) ──────────
         # Using 09:16 caused the sim to replay all historical bars from market
         # open on every start / TF-switch / restart, entering stale trades
         # (e.g. a 09:21 bar CE traded at 1:40 PM after a TF switch).
-        # By anchoring to the current minute we guarantee only candles that
-        # form AFTER the sim is (re)started can generate entries.
+        #
+        # Using exact now (HH:MM:SS) caused a different bug: if the sim starts
+        # at e.g. 10:40:32 on a 3-min TF, the most-recently-completed candle
+        # (10:39:00) would be filtered out because "10:39:00" < "10:40:32",
+        # making the sim miss a valid eligible trade signal on that bar.
+        #
+        # Fix: floor now to the start of the current candle interval so that
+        # started_at == the current candle's open timestamp. This captures the
+        # live candle (and any signal on the candle that just closed) while
+        # still preventing replay of old historical bars.
         now_ist = datetime.now(IST)
-        _sim.started_at = now_ist.strftime("%Y-%m-%d %H:%M:%S")
+        tf_minutes = {"1min": 1, "3min": 3, "5min": 5, "15min": 15}.get(tf, 3)
+        floored_minute = (now_ist.minute // tf_minutes) * tf_minutes
+        candle_open = now_ist.replace(minute=floored_minute, second=0, microsecond=0)
+        _sim.started_at = candle_open.strftime("%Y-%m-%d %H:%M:%S")
 
         if carry_position:
             # Re-inject the position that was open before the TF switch.
@@ -1329,21 +1340,59 @@ def _rsi_series(rows: list[dict], period: int = 14) -> list[float]:
 
 
 def _vma_series(rows: list[dict], length: int) -> list[float]:
-    """Return just the VMA float values for each row (same algorithm as compute_vma)."""
+    """
+    Python port of TradingView VMA_LB (LazyBear) Pine Script with warm-up seeding.
+
+    Pine Script (verbatim):
+        k = 1.0/l
+        pdm  = max((src - src[1]), 0)
+        mdm  = max((src[1] - src), 0)
+        pdmS = ((1 - k)*nz(pdmS[1]) + k*pdm)
+        mdmS = ((1 - k)*nz(mdmS[1]) + k*mdm)
+        s    = pdmS + mdmS  ;  pdi = pdmS/s  ;  mdi = mdmS/s
+        pdiS = ((1 - k)*nz(pdiS[1]) + k*pdi)
+        mdiS = ((1 - k)*nz(mdiS[1]) + k*mdi)
+        d    = abs(pdiS - mdiS)  ;  s1 = pdiS + mdiS
+        iS   = ((1 - k)*nz(iS[1]) + k*d/s1)
+        hhv  = highest(iS, l)  ;  llv = lowest(iS, l)
+        vI   = (iS - llv)/(hhv - llv)
+        vma  = (1 - k*vI)*nz(vma[1]) + k*vI*src
+
+    WARM-UP SEEDING:
+        TradingView has years of history so nz(vma[1])=0 only on the very
+        first ever bar (e.g. 2010). By today the VMA is fully converged.
+        We only have today's bars (~46 for a 3-min day). If we start vma=0,
+        the formula vma = (1-k*vI)*0 + k*vI*src converges VERY slowly
+        (alpha = k*vI is typically small), leaving VMA hundreds of points
+        below the actual price.
+
+        Fix: seed vma_prev = first bar's close.  The pdmS/mdmS/pdiS/mdiS/iS
+        series all start from 0 and converge within a handful of bars
+        (decay rate (1-k)^n for those EMA-like series is fast).  Only the
+        VMA line itself needs warm-start seeding because its effective alpha
+        k*vI is small and convergence from 0 takes far too long.
+    """
     if length <= 0:
         raise ValueError("length must be > 0")
+
     k = 1.0 / length
     pdmS = mdmS = pdiS = mdiS = iS_val = 0.0
-    vma = None
+    # Seed VMA at first bar's close so the line starts on-chart immediately.
+    # This mirrors TradingView which already has a fully-converged VMA from
+    # years of prior history before today's session begins.
+    vma_prev = rows[0]["close"] if rows else 0.0
     iS_arr: list[float] = []
     out: list[float] = []
 
     for i, r in enumerate(rows):
         src  = r["close"]
-        prev = rows[i - 1]["close"] if i > 0 else src
+        prev = rows[i - 1]["close"] if i > 0 else src  # bar 0: no prior bar → pdm=0
 
+        # Directional movement
         pdm  = max(src - prev, 0.0)
         mdm  = max(prev - src, 0.0)
+
+        # Smoothed DM (EMA-style, alpha=k)
         pdmS = (1 - k) * pdmS + k * pdm
         mdmS = (1 - k) * mdmS + k * mdm
 
@@ -1351,22 +1400,27 @@ def _vma_series(rows: list[dict], length: int) -> list[float]:
         pdi = (pdmS / s) if s else 0.0
         mdi = (mdmS / s) if s else 0.0
 
+        # Smoothed DI
         pdiS = (1 - k) * pdiS + k * pdi
         mdiS = (1 - k) * mdiS + k * mdi
 
-        d     = abs(pdiS - mdiS)
-        s1    = pdiS + mdiS
-        ratio = (d / s1) if s1 else 0.0
+        # Volatility index iS
+        d      = abs(pdiS - mdiS)
+        s1     = pdiS + mdiS
+        ratio  = (d / s1) if s1 else 0.0
         iS_val = (1 - k) * iS_val + k * ratio
         iS_arr.append(iS_val)
 
+        # Rolling highest/lowest of iS over `length` bars (Pine: highest/lowest)
         win = iS_arr[max(0, i - length + 1): i + 1]
         hhv, llv = max(win), min(win)
         rng = hhv - llv
         vI  = ((iS_val - llv) / rng) if rng else 0.0
 
-        vma = src if vma is None else (1 - k * vI) * vma + k * vI * src
-        out.append(round(vma, 4))
+        # VMA update — seeded from first bar's close (see warm-up note above)
+        vma_val  = (1 - k * vI) * vma_prev + k * vI * src
+        vma_prev = vma_val
+        out.append(round(vma_val, 4))
 
     return out
 
@@ -1429,24 +1483,28 @@ def compute_dual_vma(rows: list[dict], short_len: int = 9, long_len: int = 21) -
         # relative position of short vs long
         position = "ABOVE" if sv > lv else ("BELOW" if sv < lv else "CROSS")
 
-        # confirm_signal is signal from the previous bar
+        # confirm_signal is signal from the previous bar (used in confirmCandle mode)
         confirm_signal = results[i - 1]["signal"] if i > 0 else "NONE"
 
-        # Quality score (0-5)
+        # Quality score (0-5) — scored against the CURRENT bar's signal so that
+        # the crossover bar itself gets a non-zero quality reading.
+        # (Previously this used confirm_signal, meaning every fresh-crossover bar
+        # had quality=0 because confirm_signal was still "NONE" on that bar.)
+        active_signal = signal if signal != "NONE" else confirm_signal
         quality = 0
-        if confirm_signal != "NONE":
-            quality += 1  # Crossover confirmed
+        if active_signal != "NONE":
+            quality += 1  # Crossover present (current or confirmed)
 
             # Short slope in signal direction
-            if confirm_signal == "CE" and short_slope > 0:
+            if active_signal == "CE" and short_slope > 0:
                 quality += 1
-            elif confirm_signal == "PE" and short_slope < 0:
+            elif active_signal == "PE" and short_slope < 0:
                 quality += 1
 
             # Long slope in signal direction
-            if confirm_signal == "CE" and long_slope > 0:
+            if active_signal == "CE" and long_slope > 0:
                 quality += 1
-            elif confirm_signal == "PE" and long_slope < 0:
+            elif active_signal == "PE" and long_slope < 0:
                 quality += 1
 
             # VMA spread >= ATR * 0.5 (lines separating)
@@ -1454,9 +1512,9 @@ def compute_dual_vma(rows: list[dict], short_len: int = 9, long_len: int = 21) -
                 quality += 1
 
             # RSI confirms (CE: RSI > 55, PE: RSI < 45)
-            if confirm_signal == "CE" and rsi > 55:
+            if active_signal == "CE" and rsi > 55:
                 quality += 1
-            elif confirm_signal == "PE" and rsi < 45:
+            elif active_signal == "PE" and rsi < 45:
                 quality += 1
 
         results.append({
