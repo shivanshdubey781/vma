@@ -702,6 +702,33 @@ def _sim_process_bar(bar: dict):
     """
     params = _sim.params
 
+    # ── Market-close guards (IST) ─────────────────────────────────────────────
+    # Indian equity market closes at 15:30 IST.
+    # 1. Square off any open position at or after 15:30 (MARKET_CLOSE).
+    # 2. Block new entries at or after 15:15 to avoid opening positions
+    #    with no time left to manage them.
+    now_ist      = datetime.now(IST)
+    now_hhmm     = now_ist.hour * 60 + now_ist.minute   # minutes since midnight
+    MARKET_CLOSE = 15 * 60 + 30   # 15:30 → 930
+    NO_ENTRY     = 15 * 60 + 15   # 15:15 → 915
+
+    if _sim.position and now_hhmm >= MARKET_CLOSE:
+        # Auto square-off at market close
+        pos = _sim.position
+        ts  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        if pos.get("instrument") == "options":
+            try:
+                price = float(angel_client.get_ltp(
+                    "NFO", pos["contract"], str(pos.get("symboltoken", ""))
+                ))
+            except Exception:
+                price = float(pos.get("last_price") or pos["entry"])
+        else:
+            price = float(pos.get("last_price") or bar.get("close") or pos["entry"])
+        _sim_complete_trade(price, ts, "MARKET_CLOSE")
+        _sim.status_msg = "Position squared off at market close (15:30 IST)."
+        return
+
     # ── If we have an open position: update SL/trail/check exit ─────────────
     if _sim.position:
         pos = _sim.position
@@ -759,6 +786,10 @@ def _sim_process_bar(bar: dict):
         return  # position still open — done with this bar
 
     # ── No open position: check for entry signal ─────────────────────────────
+    # Block new entries at or after 15:15 IST
+    if now_hhmm >= NO_ENTRY:
+        return
+
     signal = _sim_get_entry_signal(bar, params)
     if signal not in ("CE", "PE"):
         return
@@ -882,17 +913,41 @@ def _server_tick():
                 _sim_process_bar(bar)
                 _sim.last_ts = bar["timestamp"]
 
+            # ── Safety net: if past market close and position still open ──────
+            # This fires when no new bars arrive after 15:30 (data feed stops)
+            # but a position is still held. Square it off directly.
+            now_ist  = datetime.now(IST)
+            now_hhmm = now_ist.hour * 60 + now_ist.minute
+            if now_hhmm >= 15 * 60 + 30 and _sim.position:
+                pos = _sim.position
+                ts  = now_ist.strftime("%Y-%m-%d %H:%M:%S")
+                if pos.get("instrument") == "options":
+                    try:
+                        price = float(angel_client.get_ltp(
+                            "NFO", pos["contract"], str(pos.get("symboltoken", ""))
+                        ))
+                    except Exception:
+                        price = float(pos.get("last_price") or pos["entry"])
+                else:
+                    price = float(pos.get("last_price") or pos["entry"])
+                _sim_complete_trade(price, ts, "MARKET_CLOSE")
+                _sim.status_msg = "Position squared off at market close (15:30 IST)."
+
         except Exception as exc:
             _sim.status_msg = f"Tick error: {exc}"
 
-    # Reschedule
+    # Reschedule — stop ticking after market close to save resources
+    now_hhmm = datetime.now(IST).hour * 60 + datetime.now(IST).minute
     interval = int(_sim.params.get("refreshInterval", 10000)) / 1000.0
     interval = max(5.0, min(interval, 60.0))
     with _sim.lock:
-        if _sim.active:
+        if _sim.active and now_hhmm < 15 * 60 + 35:   # stop at 15:35
             _sim.tick_timer = threading.Timer(interval, _server_tick)
             _sim.tick_timer.daemon = True
             _sim.tick_timer.start()
+        elif _sim.active and now_hhmm >= 15 * 60 + 35:
+            _sim.status_msg = "Market closed. Sim paused until tomorrow."
+
 
 
 def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
