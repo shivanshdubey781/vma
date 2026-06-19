@@ -498,22 +498,28 @@ function getEntrySignal(bar, simParams) {
 
 function analyzeHistoryDecisions(history, simParams) {
   const bars = Array.isArray(history) ? history : [];
-  let lastAccepted = null;
   return bars.map((bar) => {
-    const decision = getBarDecision(bar, simParams, lastAccepted);
-    if (decision.eligible) lastAccepted = decision.entrySignal;
+    const decision = getBarDecision(bar, simParams);
     return { ...bar, skipReason: decision.reason, entrySignal: decision.entrySignal };
   });
 }
 
-function getBarDecision(bar, simParams, lastAccepted) {
+function getBarDecision(bar, simParams) {
   const entrySignal   = getEntrySignal(bar, simParams);
   const hasDirectSig  = bar.signal === 'CE' || bar.signal === 'PE';
+
   if (entrySignal !== 'CE' && entrySignal !== 'PE') {
     if (simParams.confirmCandle && hasDirectSig) return { eligible: false, reason: 'Waiting for confirm candle', entrySignal: 'NONE' };
     return { eligible: false, reason: 'No entry signal', entrySignal: 'NONE' };
   }
-  if (lastAccepted && lastAccepted === entrySignal)  return { eligible: false, reason: 'Same side as last trade', entrySignal };
+
+  // Two-sides conflict: direct signal and confirm_signal are opposite directions
+  const directSig  = bar.signal         === 'CE' || bar.signal         === 'PE' ? bar.signal         : 'NONE';
+  const confirmSig = bar.confirm_signal === 'CE' || bar.confirm_signal === 'PE' ? bar.confirm_signal : 'NONE';
+  if (directSig !== 'NONE' && confirmSig !== 'NONE' && directSig !== confirmSig) {
+    return { eligible: false, reason: 'Two sides at same point', entrySignal };
+  }
+
   if (simParams.sidewaysFilter && bar.is_sideways)   return { eligible: false, reason: 'Sideways filter blocked', entrySignal };
   if ((bar.quality || 0) < (simParams.minQuality || 0)) return { eligible: false, reason: `Quality ${bar.quality||0} below min ${simParams.minQuality}`, entrySignal };
   return { eligible: true, reason: 'Eligible', entrySignal };

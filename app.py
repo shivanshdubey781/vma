@@ -799,8 +799,17 @@ def _sim_process_bar(bar: dict):
         if bar["timestamp"] <= _sim.last_exit_ts:
             return
 
-    # Alternation guard: don't take same side twice in a row
-    if _sim.last_trade_type and _sim.last_trade_type == signal:
+    # Two-sides conflict: if the bar has a direct signal AND an opposite
+    # confirm_signal simultaneously, both CE and PE are firing at the same
+    # point — skip the trade entirely.
+    direct_sig  = bar.get("signal", "NONE")
+    confirm_sig = bar.get("confirm_signal", "NONE")
+    if (
+        direct_sig  in ("CE", "PE")
+        and confirm_sig in ("CE", "PE")
+        and direct_sig != confirm_sig
+    ):
+        _sim.status_msg = "Two sides at same point — trade skipped."
         return
 
     # Sideways filter
