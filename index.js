@@ -322,7 +322,7 @@ function renderDashboard() {
         <td>${signalPill(bar.signal)}</td>
         <td>${signalPill(bar.confirm_signal)}</td>
         <td>${bar.quality ?? '-'}</td>
-        <td>${bar.is_sideways ? '<span class="sideways-pill">SW</span>' : '<span class="trending-pill">TR</span>'}</td>
+        <td>${trendPill(bar.svma_trend, bar.is_sideways)}</td>
         <td>${bar.skipReason || '-'}</td>
       </tr>`).join('');
   } else {
@@ -691,6 +691,16 @@ function registerServiceWorker() {
 function signalPill(value) {
   const n = String(value || 'NONE').toLowerCase();
   return '<span class="signal-pill ' + n + '">' + escapeHtml(String(value || 'NONE')) + '</span>';
+}
+function trendPill(trend, isSideways) {
+  if (isSideways) {
+    return '<span class="trend-pill sideways">SIDEWAYS</span>';
+  }
+  const t = String(trend || 'FLAT').toUpperCase();
+  let cls = 'flat';
+  if (t === 'UP') cls = 'up';
+  if (t === 'DOWN') cls = 'down';
+  return '<span class="trend-pill ' + cls + '">' + escapeHtml(t) + '</span>';
 }
 function reasonPill(value) {
   const m = { 'SL': { label: 'SL_HIT', cls: 'sl' }, 'TRAILING_SL': { label: 'TRAIL_SL_HIT', cls: 'trailing_sl' }, 'TARGET': { label: 'TARGET', cls: 'target' }, 'EOD': { label: 'EOD', cls: 'eod' }, 'EOD_AUTO': { label: 'EOD AUTO', cls: 'eod' }, 'MANUAL': { label: 'MANUAL', cls: 'manual_exit' } };
