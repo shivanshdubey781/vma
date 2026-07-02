@@ -1156,8 +1156,9 @@ def _on_first_request():
         return
     with _startup_lock:
         if not _startup_done:
-            _startup_done = True
             restore_sim_from_db()
+            _startup_done = True
+
 
 
 @app.route("/api/sim-state")
