@@ -849,9 +849,14 @@ def _sim_process_bar(bar: dict):
     if signal not in ("CE", "PE"):
         return
 
-    # Fresh-signal guard: skip bars at or before the last exit bar
+    # Fresh-signal guard: skip bars at or before the last exit bar.
+    # If the crossover signal occurs on the exact same bar as the exit,
+    # block entry ONLY if it is in the same direction as the exited trade
+    # to prevent instant duplicate re-entry while allowing trend reversals.
     if _sim.last_exit_ts:
-        if bar["timestamp"] <= _sim.last_exit_ts:
+        if bar["timestamp"] < _sim.last_exit_ts:
+            return
+        if bar["timestamp"] == _sim.last_exit_ts and signal == _sim.last_trade_type:
             return
 
     # Two-sides conflict: if the bar has a direct signal AND an opposite

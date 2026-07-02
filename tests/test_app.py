@@ -87,7 +87,7 @@ def test_unknown_api_route_returns_json():
     assert payload["ok"] is False
 
 
-def test_bullish_price_context_overrides_bearish_micro_cross(monkeypatch):
+def test_bearish_micro_cross_not_overridden(monkeypatch):
     rows = [
         {"timestamp": "t0", "open": 10, "high": 11, "low": 9, "close": 10},
         {"timestamp": "t1", "open": 12, "high": 13, "low": 11, "close": 12},
@@ -102,4 +102,24 @@ def test_bullish_price_context_overrides_bearish_micro_cross(monkeypatch):
 
     result = app_module.compute_dual_vma(rows, short_len=5, long_len=9)
 
-    assert result[1]["signal"] == "CE"
+    assert result[1]["signal"] == "PE"
+
+
+def test_same_bar_reversal_allowed():
+    # Setup _sim state
+    app_module._sim.last_exit_ts = "2026-07-02 09:18:00"
+    app_module._sim.last_trade_type = "PE"
+    app_module._sim.position = None
+    app_module._sim.params = {"confirmCandle": False, "minQuality": 0}
+
+    bar = {
+        "timestamp": "2026-07-02 09:18:00",
+        "signal": "CE",
+        "confirm_signal": "NONE",
+        "quality": 2,
+        "is_sideways": False
+    }
+
+    # Verify that opposite direction (CE) on same bar is allowed (not skipped)
+    sig = app_module._sim_get_entry_signal(bar, app_module._sim.params)
+    assert sig == "CE"
