@@ -693,6 +693,10 @@ def _sim_complete_trade(exit_price: float, exit_ts: str, reason: str):
                 },
             },
         })
+        save_active_vma_trade({
+            "session_id": _sim.session_id,
+            "status": "CLOSED",
+        })
     except Exception:
         pass  # don't crash the tick if DB write fails
 

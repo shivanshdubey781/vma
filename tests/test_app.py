@@ -123,3 +123,34 @@ def test_same_bar_reversal_allowed():
     # Verify that opposite direction (CE) on same bar is allowed (not skipped)
     sig = app_module._sim_get_entry_signal(bar, app_module._sim.params)
     assert sig == "CE"
+
+
+def test_sim_complete_trade_deletes_active_trade(monkeypatch):
+    called_with = []
+    def fake_save_active_vma_trade(payload):
+        called_with.append(payload)
+        return {"session_id": payload.get("session_id"), "status": payload.get("status")}
+
+    monkeypatch.setattr(app_module, "save_active_vma_trade", fake_save_active_vma_trade)
+    monkeypatch.setattr(app_module, "save_vma_trades", lambda payload: {"inserted": 1, "updated": 0, "total": 1})
+
+    # Setup sim state with a fake position
+    app_module._sim.position = {
+        "type": "CE",
+        "entry": 100.0,
+        "entry_ts": "t0",
+        "init_sl": 90.0,
+        "cur_sl": 90.0,
+        "tgt": 110.0,
+        "lot_size": 1,
+    }
+    app_module._sim.session_id = "test-session-complete"
+    app_module._sim.params = {"lotSize": 1}
+    app_module._sim.trades = []
+
+    app_module._sim_complete_trade(90.0, "t1", "SL")
+
+    # Verify save_active_vma_trade was called with CLOSED status
+    assert len(called_with) == 1
+    assert called_with[0]["session_id"] == "test-session-complete"
+    assert called_with[0]["status"] == "CLOSED"
