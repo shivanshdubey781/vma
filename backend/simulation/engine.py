@@ -13,7 +13,8 @@ from backend.models import (
     SimulatedTrade,
 )
 from backend.risk.engine import RiskEngine
-from backend.utils.time import session_key
+from backend.utils.time import parse_timestamp, session_key
+
 
 
 class PaperTradingSimulator:
@@ -48,6 +49,13 @@ class PaperTradingSimulator:
                 trade_count_today = 0
                 last_session = current_session
 
+            try:
+                dt = parse_timestamp(candle.timestamp)
+                hhmm = dt.hour * 100 + dt.minute
+            except Exception:
+                hhmm = 0
+
+
             if pending_signal_index is not None:
                 entry_snapshot = snapshots[pending_signal_index]
                 entry_signal = signals[pending_signal_index]
@@ -58,6 +66,9 @@ class PaperTradingSimulator:
                     consecutive_losses=consecutive_losses,
                     peak_equity=peak_equity,
                 )
+                if hhmm >= 1515:
+                    allowed = False
+                    reason = "Time cutoff (>= 15:15)"
                 if allowed and position.side == PositionSide.NO_POSITION:
                     active_trade, position = self._open_position(
                         symbol=symbol,
@@ -89,6 +100,34 @@ class PaperTradingSimulator:
                     day_pnl += closed_trade.pnl_after_costs
                     consecutive_losses = consecutive_losses + 1 if closed_trade.pnl_after_costs < 0 else 0
                     active_trade = None
+
+                # Force End-of-Day squareoff if active_trade is still open and time is >= 15:22 or it is the last candle of the day
+                is_last_candle_of_day = False
+                if index + 1 < len(candles):
+                    next_session = session_key(candles[index + 1].timestamp)
+                    if next_session != current_session:
+                        is_last_candle_of_day = True
+                else:
+                    is_last_candle_of_day = True
+
+                if active_trade and (hhmm >= 1522 or is_last_candle_of_day):
+                    closed_trade = self._close_trade(
+                        trade=active_trade,
+                        position=position,
+                        exit_price=candle.close,
+                        exit_time=candle.timestamp,
+                        exit_index=index,
+                        exit_reason="EOD",
+                    )
+                    trades.append(closed_trade)
+                    equity += closed_trade.pnl_after_costs
+                    peak_equity = max(peak_equity, equity)
+                    equity_curve.append(round(equity, 4))
+                    day_pnl += closed_trade.pnl_after_costs
+                    consecutive_losses = consecutive_losses + 1 if closed_trade.pnl_after_costs < 0 else 0
+                    active_trade = None
+                    position = PositionSnapshot(symbol=symbol)
+
 
             signal = signals[index]
             signal_log.append(

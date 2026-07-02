@@ -746,9 +746,13 @@ def _handle_eod():
             _sim.tick_timer = None
         _sim.status_msg = "[EOD] Bot auto-stopped at 15:25 IST. Will resume tomorrow."
 
-    # ── Phase 3: Clear side-lock for fresh next-day signal ───────────────────
+    # ── Phase 3: Clear side-lock AND last_exit_ts for fresh next-day signal ──
+    # last_exit_ts is cleared here so that tomorrow's morning bars are never
+    # blocked by today's EOD exit timestamp (belt-and-suspenders alongside
+    # the reset() call in _start_server_sim).
     if hhmm >= 1522:
         _sim.last_trade_type = None
+        _sim.last_exit_ts    = None
 
 
 
@@ -763,11 +767,27 @@ def _sim_process_bar(bar: dict):
     now_ist  = datetime.now(IST)
     now_hhmm = now_ist.hour * 100 + now_ist.minute   # HHMM e.g. 1522
 
+    # Parse bar time to enforce EOD and entry cutoffs historically/in replay
+    ts = bar.get("timestamp")
+    bar_hhmm = 0
+    if ts:
+        try:
+            bar_dt = parse_timestamp(ts)
+            bar_hhmm = bar_dt.hour * 100 + bar_dt.minute
+        except Exception:
+            pass
 
     # ── If we have an open position: update SL/trail/check exit ─────────────
     if _sim.position:
         pos = _sim.position
         ts = bar["timestamp"]
+
+        # EOD exit check using bar's timestamp
+        if bar_hhmm >= 1522:
+            price = _get_live_ltp(pos, fallback_bar=bar)
+            _sim_complete_trade(price, ts, "AUTO_EOD_EXIT")
+            return
+
 
         if pos.get("instrument") == "options":
             # Fetch live option LTP for the existing contract
@@ -822,7 +842,7 @@ def _sim_process_bar(bar: dict):
 
     # ── No open position: check for entry signal ─────────────────────────────
     # No new entries after 15:15 IST (handled here, after position-management)
-    if now_hhmm >= 1515:
+    if now_hhmm >= 1515 or (bar_hhmm >= 1515 if bar_hhmm > 0 else False):
         return
 
     signal = _sim_get_entry_signal(bar, params)
@@ -1009,14 +1029,14 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
         # (9:15 bar) AND its confirm bar (9:18 bar) are both < "09:21:00" and
         # get filtered out → first trade of the day is permanently missed.
         #
-        # Fix: during the morning session (before 10:30 IST) always anchor
+        # Fix: during the morning session (before 11:00 IST) always anchor
         # started_at to market open (09:15:00) so every bar from the first
-        # candle onwards is eligible.  After 10:30 we fall back to the
+        # candle onwards is eligible.  After 11:00 we fall back to the
         # candle-floor approach to prevent stale-signal replay on mid-day
         # restarts / TF-switches.
         now_ist = datetime.now(IST)
         tf_minutes = {"1min": 1, "3min": 3, "5min": 5, "15min": 15}.get(tf, 3)
-        market_open_cutoff = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
+        market_open_cutoff = now_ist.replace(hour=11, minute=0, second=0, microsecond=0)
         if now_ist <= market_open_cutoff:
             # Morning session: anchor to 09:15 so we never miss the first bar
             _sim.started_at = now_ist.strftime("%Y-%m-%d") + " 09:15:00"
@@ -1154,15 +1174,28 @@ def api_sim_control():
         if not params:
             return jsonify({"ok": False, "error": "params required"}), 400
 
-        # ── Idempotency guard: if the sim is already running with the same tf,
-        #    just return success without resetting state (Bug 4 fix).
+        # ── Idempotency guard: if the sim is already running with the same tf
+        #    AND started_at belongs to TODAY, just return success without
+        #    resetting state (Bug 4 fix).
+        #
+        #    The date check is critical: if the process runs 24/7 and the bot
+        #    was somehow left active from a previous calendar day (e.g. EOD
+        #    stop failed), we must NOT treat it as already-active — we need a
+        #    fresh reset() so started_at and last_exit_ts are cleared for the
+        #    new trading day, ensuring the morning's first bar is never skipped.
+        today_ist_str = datetime.now(IST).strftime("%Y-%m-%d")
         with _sim.lock:
+            started_at_date = (
+                _sim.started_at[:10] if _sim.started_at and len(_sim.started_at) >= 10
+                else ""
+            )
             already_active = (
                 _sim.active
                 and _sim.tf == tf
                 and _sim.params.get("sl") == params.get("sl")
                 and _sim.params.get("target") == params.get("target")
                 and _sim.params.get("instrument") == params.get("instrument")
+                and started_at_date == today_ist_str   # ← must be TODAY's session
             )
             current_session = _sim.session_id
         if already_active:
