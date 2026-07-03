@@ -236,29 +236,27 @@ class AngelOneClient:
         }
         last_error = "Angel One LTP request failed"
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 self._ensure_session(force=attempt > 0)
                 response = self._post_json(ANGEL_LTP_PATH, payload, authorized=True)
+                if response.get("status"):
+                    data = response.get("data") or {}
+                    ltp = data.get("ltp")
+                    if ltp in (None, ""):
+                        raise RuntimeError("Angel One returned no LTP for the selected instrument")
+                    return float(ltp)
+                last_error = response.get("message") or response.get("errorcode") or last_error
             except RuntimeError as exc:
                 last_error = str(exc)
-                if attempt == 0 and self._should_retry_login(last_error):
-                    continue
-                raise
 
-            if response.get("status"):
-                data = response.get("data") or {}
-                ltp = data.get("ltp")
-                if ltp in (None, ""):
-                    raise RuntimeError("Angel One returned no LTP for the selected instrument")
-                return float(ltp)
-
-            last_error = response.get("message") or response.get("errorcode") or last_error
-            if attempt == 0 and self._should_retry_login(last_error):
+            if attempt < 2:
+                time.sleep(1.0)
                 continue
             raise RuntimeError(last_error)
 
         raise RuntimeError(last_error)
+
 
     def get_nifty_option_ltp(self, side: str, spot_price: float) -> dict:
         contract = self.resolve_nifty_option(side, spot_price)
@@ -900,7 +898,7 @@ def _sim_process_bar(bar: dict):
             sym_tok  = quote.get("symboltoken")
         except Exception as exc:
             _sim.status_msg = f"LTP fetch failed: {exc}"
-            return
+            raise RuntimeError(f"LTP fetch failed: {exc}") from exc
 
         _sim.position = {
             "type":        signal,
