@@ -853,7 +853,23 @@ def _sim_process_bar(bar: dict):
                 if bar["low"] <= pos["tgt"]:
                     _sim_complete_trade(pos["tgt"], ts, "TARGET")
                     return
-        return  # position still open — done with this bar
+        # ── Reversal check: opposite signal while position is open ───────────
+        # If a CE fires while holding PE (or vice versa), close the current
+        # trade immediately and fall through to open the new direction below.
+        reversal_signal = _sim_get_entry_signal(bar, params)
+        pos_type = pos.get("type", "")
+        is_reversal = (
+            reversal_signal in ("CE", "PE")
+            and pos_type in ("CE", "PE")
+            and reversal_signal != pos_type
+        )
+        if is_reversal:
+            rev_price = _get_live_ltp(pos, fallback_bar=bar)
+            _sim_complete_trade(rev_price, ts, "REVERSAL")
+            # Don't return — fall through to open the new position below
+        else:
+            return  # position still open — done with this bar
+
 
     # ── No open position: check for entry signal ─────────────────────────────
     # No new entries after 15:15 IST (handled here, after position-management)
