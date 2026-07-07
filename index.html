@@ -298,6 +298,28 @@
         <div class="active-grid" id="activeTradeGrid"></div>
       </div>
 
+      <!-- Skip Log — shows why eligible bars were not traded -->
+      <div class="table-section" id="skipLogSection">
+        <div class="section-header-row">
+          <h3 class="section-title">
+            <span class="icon-dot warn-dot" aria-hidden="true"></span>
+            Skipped Bars Log
+          </h3>
+          <span class="mono subtle" id="skipLogMeta">Last 20 skipped signal bars</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Skip Reason</th>
+              </tr>
+            </thead>
+            <tbody id="skipLogTable"><tr><td class="empty-row" colspan="2">No skipped bars yet.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="table-wrap trade-history-wrap">
         <table>
           <thead>

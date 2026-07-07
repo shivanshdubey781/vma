@@ -579,6 +579,7 @@ class SimState:
         self.manual_pause  = False
         self.tick_timer    = None        # threading.Timer handle
         self.status_msg    = ""          # human-readable status for UI
+        self.skip_log      = []          # rolling log of skipped bars [{ts, reason}, ...]
 
     def to_dict(self) -> dict:
         with self.lock:
@@ -595,10 +596,22 @@ class SimState:
                 "last_trade_type":  self.last_trade_type,
                 "manual_pause":     self.manual_pause,
                 "status_msg":       self.status_msg,
+                "skip_log":         list(self.skip_log[-20:]),   # last 20 skipped bars
             }
 
 
 _sim = SimState()
+
+
+def _sim_log_skip(bar: dict, reason: str) -> None:
+    """Record a skipped bar with its reason in _sim.skip_log and status_msg."""
+    entry = {"ts": bar.get("timestamp", "?"), "reason": reason}
+    _sim.skip_log.append(entry)
+    # Keep the log bounded — retain last 50 entries
+    if len(_sim.skip_log) > 50:
+        _sim.skip_log = _sim.skip_log[-50:]
+    _sim.status_msg = f"Skipped [{entry['ts']}]: {reason}"
+
 
 # ── EOD date-guards (prevent double-firing on the same calendar day) ─────────
 _eod_exit_date = None   # date string 'YYYY-MM-DD' of last auto-exit
@@ -845,10 +858,14 @@ def _sim_process_bar(bar: dict):
     # ── No open position: check for entry signal ─────────────────────────────
     # No new entries after 15:15 IST (handled here, after position-management)
     if now_hhmm >= 1515 or (bar_hhmm >= 1515 if bar_hhmm > 0 else False):
+        _sim_log_skip(bar, f"Entry cutoff — time {bar_hhmm // 100:02d}:{bar_hhmm % 100:02d} >= 15:15 or live clock past 15:15")
         return
 
     signal = _sim_get_entry_signal(bar, params)
     if signal not in ("CE", "PE"):
+        raw_sig = bar.get("signal", "NONE")
+        raw_cnf = bar.get("confirm_signal", "NONE")
+        _sim_log_skip(bar, f"No entry signal (signal={raw_sig}, confirm={raw_cnf}, confirmCandle={params.get('confirmCandle')}, minQuality={params.get('minQuality', 0)})")
         return
 
     # Fresh-signal guard: skip bars at or before the last exit bar.
@@ -857,8 +874,10 @@ def _sim_process_bar(bar: dict):
     # to prevent instant duplicate re-entry while allowing trend reversals.
     if _sim.last_exit_ts:
         if bar["timestamp"] < _sim.last_exit_ts:
+            _sim_log_skip(bar, f"Fresh-signal guard: bar {bar['timestamp']} < last_exit_ts {_sim.last_exit_ts}")
             return
         if bar["timestamp"] == _sim.last_exit_ts and signal == _sim.last_trade_type:
+            _sim_log_skip(bar, f"Same-bar duplicate guard: {signal} re-entry on exit bar {_sim.last_exit_ts}")
             return
 
     # Two-sides conflict: if the bar has a direct signal AND an opposite
@@ -871,15 +890,17 @@ def _sim_process_bar(bar: dict):
         and confirm_sig in ("CE", "PE")
         and direct_sig != confirm_sig
     ):
-        _sim.status_msg = "Two sides at same point — trade skipped."
+        _sim_log_skip(bar, f"Two sides at same point (signal={direct_sig}, confirm={confirm_sig}) — trade skipped")
         return
 
     # Sideways filter
     if params.get("sidewaysFilter") and bar.get("is_sideways"):
+        _sim_log_skip(bar, "Sideways filter blocked — market is sideways")
         return
 
     # Quality filter
     if (bar.get("quality") or 0) < (params.get("minQuality") or 0):
+        _sim_log_skip(bar, f"Quality filter: bar quality {bar.get('quality', 0)} < minQuality {params.get('minQuality', 0)}")
         return
 
     # ── Open a new position ───────────────────────────────────────────────────

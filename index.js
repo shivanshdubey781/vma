@@ -360,8 +360,24 @@ function renderSimulation() {
   els.statRR.textContent       = trades.length ? (avgL > 0 ? Math.round((1 / (1 + rr)) * 100) + '%' : '0%') : '-';
 
   renderActivePosition();
+  renderSkipLog();
   els.simBtn.textContent = active ? 'Stop Simulation' : 'Run Simulation';
   els.simBtn.classList.toggle('stop', active);
+}
+
+function renderSkipLog() {
+  const el = document.getElementById('skipLogTable');
+  if (!el) return;
+  const log = (state.sim && Array.isArray(state.sim.skip_log)) ? state.sim.skip_log.slice().reverse() : [];
+  if (log.length === 0) {
+    el.innerHTML = '<tr><td class="empty-row" colspan="2">No skipped bars yet.</td></tr>';
+    return;
+  }
+  el.innerHTML = log.map((entry) => `
+    <tr>
+      <td class="mono time-col">${formatDateTime(entry.ts)}</td>
+      <td class="skip-reason">${escapeHtml(entry.reason || '-')}</td>
+    </tr>`).join('');
 }
 
 function renderActivePosition() {
