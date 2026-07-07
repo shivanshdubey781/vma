@@ -568,7 +568,7 @@ class SimState:
     def reset(self):
         self.active        = False
         self.params        = {}          # sl, target, trailTrigger, trailLock, lotSize, slen, llen, instrument, sidewaysFilter, confirmCandle, minQuality, delta
-        self.tf            = "5min"
+        self.tf            = "3min"
         self.session_id    = None
         self.started_at    = None        # IST timestamp string of first bar processed
         self.position      = None        # dict: type, instrument, entry, entry_ts, init_sl, cur_sl, tgt, contract, expiry, lot_size, last_price
@@ -1143,7 +1143,7 @@ def restore_sim_from_db():
             _sim.active      = True
             _sim.position    = pos
             _sim.params      = meta.get("params") or {}
-            _sim.tf          = meta.get("timeframe") or "5min"
+            _sim.tf          = meta.get("timeframe") or "3min"
             _sim.started_at  = meta.get("started_at") or (
                 datetime.now(IST).strftime("%Y-%m-%d") + " 09:16:00"
             )
@@ -1198,7 +1198,7 @@ def api_sim_control():
 
     if action == "start":
         params     = payload.get("params") or {}
-        tf         = str(payload.get("tf") or "5min")
+        tf         = str(payload.get("tf") or "3min")
         refresh_ms = int(payload.get("refresh_ms") or 10000)
         if not params:
             return jsonify({"ok": False, "error": "params required"}), 400
@@ -1703,7 +1703,7 @@ def api_dual_vma():
     long_len  : int  (default 20)
     limit     : int  bars to fetch (default 2000)
     """
-    timeframe = request.args.get("tf",        "5min")
+    timeframe = request.args.get("tf",        "3min")
     short_len = int(request.args.get("short_len", 9))
     long_len  = int(request.args.get("long_len",  21))
     limit     = int(request.args.get("limit",    2000))

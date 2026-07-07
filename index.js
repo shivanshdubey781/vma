@@ -1,11 +1,11 @@
 'use strict';
 
 // ─── Storage key bumped to v4 so stale localStorage is auto-cleared ───────────
-const STORAGE_KEY    = 'vma_dashboard_state_v4';
+const STORAGE_KEY    = 'vma_dashboard_state_v5';
 const INDIA_TIMEZONE = 'Asia/Kolkata';
 const MARKET_WINDOW  = Object.freeze({ startMinutes: 9 * 60 + 16, endMinutes: 15 * 60 + 30 });
 const DEFAULTS = Object.freeze({
-  timeframe: '5min', shortLen: '5', longLen: '9', refreshInterval: '10000',
+  timeframe: '3min', shortLen: '5', longLen: '9', refreshInterval: '10000',
   instrument: 'options', sl: '40', target: '60', trailTrigger: '25',
   trailLock: '15', lotSize: '65', delta: '0.5', minQuality: '2',
   sidewaysFilter: false, confirmCandle: false,
