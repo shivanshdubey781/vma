@@ -78,11 +78,9 @@
           <div class="controls-grid">
             <div class="field-group">
               <label for="timeframe">Timeframe</label>
-              <select id="timeframe">
-                <option value="1min">1 Minute</option>
-                <option value="3min">3 Minute</option>
-                <option value="5min" selected>5 Minute</option>
-              </select>
+              <!-- Locked to 3min — hidden input keeps all JS working unchanged -->
+              <input type="hidden" id="timeframe" value="3min">
+              <div class="tf-locked-badge">3 Min</div>
             </div>
             <div class="field-group">
               <label for="shortLen">Short VMA</label>

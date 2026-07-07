@@ -574,11 +574,11 @@ function restoreFormState() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) { applyDefaultFormValues(); return; }
     const saved = JSON.parse(raw);
-    // Clear old format (v3) automatically
-    if (!saved.version || saved.version < 4) { applyDefaultFormValues(); return; }
+    // Clear old format (v4 and below) automatically
+    if (!saved.version || saved.version < 5) { applyDefaultFormValues(); return; }
     els.shortLen.value        = saved.shortLen        || DEFAULTS.shortLen;
     els.longLen.value         = saved.longLen         || DEFAULTS.longLen;
-    els.timeframe.value       = saved.tf              || DEFAULTS.timeframe;
+    // timeframe is locked to 3min — do not restore from saved state
     els.refreshInterval.value = saved.refreshInterval || DEFAULTS.refreshInterval;
     if (saved.simFields) {
       els.inpInstrument.value       = saved.simFields.instrument    || DEFAULTS.instrument;

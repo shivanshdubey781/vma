@@ -1183,7 +1183,32 @@ tbody tr:last-child td { border-bottom: 0; }
 .primary-column > .panel:nth-child(4) { animation: fadeSlideUp 0.5s var(--ease) 0.25s both; }
 .side-panel      { animation: fadeSlideUp 0.5s var(--ease) 0.18s both; }
 
-/* ── Skip Log Section ─────────────────────────────────────────────────── */
+/* ── Locked Timeframe Badge ───────────────────────────────────────────── */
+.tf-locked-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0 1rem;
+  height: 42px;
+  background: rgba(93, 184, 255, 0.06);
+  border: 1.5px solid rgba(93, 184, 255, 0.2);
+  border-radius: var(--radius-xs);
+  color: var(--blue);
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: not-allowed;
+  user-select: none;
+  box-sizing: border-box;
+}
+
+.tf-locked-badge::before {
+  content: '🔒';
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+
 .table-section {
   margin-top: 1.25rem;
 }
