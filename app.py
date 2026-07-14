@@ -919,8 +919,12 @@ def _sim_process_bar(bar: dict):
             expiry   = quote.get("expiry")
             sym_tok  = quote.get("symboltoken")
         except Exception as exc:
-            _sim.status_msg = f"LTP fetch failed: {exc}"
-            raise RuntimeError(f"LTP fetch failed: {exc}") from exc
+            # LTP fetch failed (common at market-open due to Angel One API
+            # rate-limiting or a stale login token).  Log the skip so the
+            # caller can advance last_ts past this bar and try the next one
+            # rather than getting stuck retrying the same bar every tick.
+            _sim_log_skip(bar, f"LTP fetch failed — skipping bar: {exc}")
+            return  # return normally so last_ts is updated by the caller
 
         _sim.position = {
             "type":        signal,
@@ -1003,8 +1007,11 @@ def _server_tick():
             ]
 
             for bar in new_bars:
-                _sim_process_bar(bar)
+                # Advance last_ts BEFORE processing so that even if
+                # _sim_process_bar raises (e.g. a truly unexpected error)
+                # the tick loop does not retry the same bar forever.
                 _sim.last_ts = bar["timestamp"]
+                _sim_process_bar(bar)
 
             # ── EOD auto-controls (exit 15:22, stop 15:25) ────────────────────
             _handle_eod()
