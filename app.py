@@ -62,6 +62,12 @@ def _totp_now(secret: str, step: int = 30, digits: int = 6) -> str:
     return str(code % (10 ** digits)).zfill(digits)
 
 
+class _LTPError(Exception):
+    """Raised when Angel One LTP fetch fails for an eligible options bar.
+    The tick loop catches this and retries the same bar on the next tick
+    (last_ts is NOT advanced), rather than permanently skipping the signal.
+    """
+
 class AngelOneClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("ANGEL_API_KEY", "").strip()
@@ -920,11 +926,12 @@ def _sim_process_bar(bar: dict):
             sym_tok  = quote.get("symboltoken")
         except Exception as exc:
             # LTP fetch failed (common at market-open due to Angel One API
-            # rate-limiting or a stale login token).  Log the skip so the
-            # caller can advance last_ts past this bar and try the next one
-            # rather than getting stuck retrying the same bar every tick.
-            _sim_log_skip(bar, f"LTP fetch failed — skipping bar: {exc}")
-            return  # return normally so last_ts is updated by the caller
+            # rate-limiting or a stale login token).
+            # Raise _LTPError so the tick loop can hold last_ts at the
+            # PREVIOUS bar and retry THIS bar on the next tick — preserving
+            # the signal rather than permanently skipping it.
+            _sim.status_msg = f"LTP fetch failed — will retry: {exc}"
+            raise _LTPError(str(exc)) from exc
 
         _sim.position = {
             "type":        signal,
@@ -1007,11 +1014,22 @@ def _server_tick():
             ]
 
             for bar in new_bars:
-                # Advance last_ts BEFORE processing so that even if
-                # _sim_process_bar raises (e.g. a truly unexpected error)
-                # the tick loop does not retry the same bar forever.
-                _sim.last_ts = bar["timestamp"]
-                _sim_process_bar(bar)
+                try:
+                    _sim_process_bar(bar)
+                    # Only advance last_ts after successful (or cleanly-skipped)
+                    # processing so LTP retries work correctly.
+                    _sim.last_ts = bar["timestamp"]
+                except _LTPError:
+                    # Angel One LTP unavailable for this bar.
+                    # Break WITHOUT advancing last_ts so the same bar is
+                    # retried on the next tick — the signal is preserved.
+                    break
+                except Exception as exc:
+                    # Unexpected error: advance last_ts anyway so the bot
+                    # does not retry this bar forever.
+                    _sim.last_ts = bar["timestamp"]
+                    _sim.status_msg = f"Bar error (skipped): {exc}"
+                    break
 
             # ── EOD auto-controls (exit 15:22, stop 15:25) ────────────────────
             _handle_eod()
