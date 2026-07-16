@@ -514,9 +514,38 @@ function getEntrySignal(bar, simParams) {
 
 function analyzeHistoryDecisions(history, simParams) {
   const bars = Array.isArray(history) ? history : [];
+  
+  // Get active position details from current sim state
+  const activePos = state.sim && state.sim.position;
+  const activeEntry = activePos ? activePos.entry_ts : null;
+  
+  // Get completed trades in the current session
+  const simTrades = state.sim && Array.isArray(state.sim.trades) ? state.sim.trades : [];
+
   return bars.map((bar) => {
+    const t_bar = bar.timestamp;
+    
+    // Check if a position was active during this bar (excluding the entry bar itself)
+    let isPositionActive = false;
+    if (activeEntry && t_bar > activeEntry) {
+      isPositionActive = true;
+    }
+    if (!isPositionActive) {
+      for (const trade of simTrades) {
+        if (trade.entryTs && trade.exitTs && t_bar > trade.entryTs && t_bar <= trade.exitTs) {
+          isPositionActive = true;
+          break;
+        }
+      }
+    }
+
     const decision = getBarDecision(bar, simParams);
-    return { ...bar, skipReason: decision.reason, entrySignal: decision.entrySignal };
+    let reason = decision.reason;
+    if (isPositionActive && decision.eligible) {
+      reason = 'Position already active';
+    }
+
+    return { ...bar, skipReason: reason, entrySignal: decision.entrySignal };
   });
 }
 
