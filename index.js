@@ -79,9 +79,17 @@ function bindEvents() {
   els.inpInstrument.addEventListener('change', updateInstrumentMode);
   ['shortLen', 'simShortLen'].forEach((id) => els[id].addEventListener('input', syncLengthFields));
   ['longLen',  'simLongLen' ].forEach((id) => els[id].addEventListener('input', syncLengthFields));
-  ['refreshInterval', 'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock',
-   'inpLotSize', 'inpDelta', 'inpMinQuality', 'inpSidewaysFilter', 'inpConfirmCandle',
-  ].forEach((id) => { els[id].addEventListener('change', persistFormState); });
+  // Fields that can be hot-patched into a running simulation without restart
+  ['inpSidewaysFilter', 'inpConfirmCandle', 'inpMinQuality',
+   'inpSL', 'inpTarget', 'inpTrailTrigger', 'inpTrailLock', 'inpLotSize', 'inpDelta',
+  ].forEach((id) => {
+    els[id].addEventListener('change', async () => {
+      persistFormState();
+      await patchSimParams();
+    });
+  });
+  // Refresh interval only needs a persist (no live patch needed)
+  els.refreshInterval.addEventListener('change', persistFormState);
   els.timeframe.addEventListener('change', handleTimeframeChange);
   els.closeActiveTradeBtn.addEventListener('click', closeActivePositionManually);
 
@@ -128,6 +136,42 @@ async function sendSimControl(action) {
     renderAll();
   } catch (err) {
     setStatus('Sim control error: ' + err.message, true);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE PARAM SYNC — push filter/risk changes to server without restart
+// ─────────────────────────────────────────────────────────────────────────────
+async function patchSimParams() {
+  const sim = state.sim;
+  if (!sim || !sim.active) return;  // only patch if sim is running
+
+  const params = {
+    sidewaysFilter: els.inpSidewaysFilter.checked,
+    confirmCandle:  els.inpConfirmCandle.checked,
+    minQuality:     parseInt(els.inpMinQuality.value, 10) || 0,
+    sl:             parseFloat(els.inpSL.value)           || 0,
+    target:         parseFloat(els.inpTarget.value)       || 0,
+    trailTrigger:   parseFloat(els.inpTrailTrigger.value) || 0,
+    trailLock:      parseFloat(els.inpTrailLock.value)    || 0,
+    lotSize:        parseInt(els.inpLotSize.value, 10)    || 65,
+    delta:          parseFloat(els.inpDelta.value)        || 0.5,
+  };
+
+  try {
+    const resp = await fetch('/api/sim-control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'patch_params', params }),
+    });
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'Param patch failed');
+    // Refresh server state so display reflects new params immediately
+    await pollSimState();
+    renderAll();
+    setStatus('Live params updated — takes effect on the next bar.', false, true);
+  } catch (err) {
+    setStatus('Live param update failed: ' + err.message, true);
   }
 }
 

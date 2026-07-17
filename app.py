@@ -1290,6 +1290,30 @@ def api_sim_control():
             _start_server_sim(old_params, tf, refresh_ms, carry_position=open_position)
         return jsonify({"ok": True, "carried_position": bool(open_position)})
 
+    if action == "patch_params":
+        """
+        Hot-patch mutable filter/risk params on a running simulation.
+        This lets the browser push UI changes (sidewaysFilter, minQuality,
+        confirmCandle, sl, target, trailTrigger, trailLock, lotSize, delta)
+        to the server in real-time WITHOUT a stop/restart cycle.
+        Only keys that are present in the request payload are updated.
+        VMA lengths (slen, llen) and instrument/tf are intentionally excluded
+        because changing those requires a full restart.
+        """
+        patch = payload.get("params") or {}
+        PATCHABLE = {
+            "sidewaysFilter", "minQuality", "confirmCandle",
+            "sl", "target", "trailTrigger", "trailLock", "lotSize", "delta",
+        }
+        with _sim.lock:
+            for key, val in patch.items():
+                if key in PATCHABLE:
+                    _sim.params[key] = val
+            _sim.status_msg = "Params updated live: " + ", ".join(
+                f"{k}={v}" for k, v in patch.items() if k in PATCHABLE
+            )
+        return jsonify({"ok": True, "patched": {k: v for k, v in patch.items() if k in PATCHABLE}})
+
     return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
 
 
