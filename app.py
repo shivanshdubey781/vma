@@ -700,7 +700,7 @@ def _sim_complete_trade(exit_price: float, exit_ts: str, reason: str):
                     "instrument":     _sim.params.get("instrument", "options"),
                     "llen":           int(_sim.params.get("llen", 9)),
                     "lotSize":        int(_sim.params.get("lotSize", 65)),
-                    "minQuality":     int(_sim.params.get("minQuality", 2)),
+                    "minQuality":     int(_sim.params.get("minQuality", 3)),
                     "sidewaysFilter": bool(_sim.params.get("sidewaysFilter")),
                     "sl":             float(_sim.params.get("sl", 40)),
                     "slen":           int(_sim.params.get("slen", 5)),

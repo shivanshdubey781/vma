@@ -7,7 +7,7 @@ const MARKET_WINDOW  = Object.freeze({ startMinutes: 9 * 60 + 16, endMinutes: 15
 const DEFAULTS = Object.freeze({
   timeframe: '3min', shortLen: '5', longLen: '9', refreshInterval: '10000',
   instrument: 'options', sl: '40', target: '60', trailTrigger: '25',
-  trailLock: '15', lotSize: '65', delta: '0.5', minQuality: '2',
+  trailLock: '15', lotSize: '65', delta: '0.5', minQuality: '3',
   sidewaysFilter: false, confirmCandle: false,
 });
 
