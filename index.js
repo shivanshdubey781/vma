@@ -412,7 +412,9 @@ function renderSimulation() {
 function renderSkipLog() {
   const el = document.getElementById('skipLogTable');
   if (!el) return;
-  const log = (state.sim && Array.isArray(state.sim.skip_log)) ? state.sim.skip_log.slice().reverse() : [];
+  const raw = (state.sim && Array.isArray(state.sim.skip_log)) ? state.sim.skip_log : [];
+  // Only show meaningful skips — hide routine "No entry signal" noise
+  const log = raw.filter((e) => !String(e.reason || '').startsWith('No entry signal')).slice().reverse();
   if (log.length === 0) {
     el.innerHTML = '<tr><td class="empty-row" colspan="2">No skipped bars yet.</td></tr>';
     return;

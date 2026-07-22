@@ -872,7 +872,7 @@ def _sim_process_bar(bar: dict):
     if signal not in ("CE", "PE"):
         raw_sig = bar.get("signal", "NONE")
         raw_cnf = bar.get("confirm_signal", "NONE")
-        _sim_log_skip(bar, f"No entry signal (signal={raw_sig}, confirm={raw_cnf}, confirmCandle={params.get('confirmCandle')}, minQuality={params.get('minQuality', 0)})")
+        # No crossover on this bar — routine, don't clutter the skip log.
         return
 
     # Fresh-signal guard: skip bars at or before the last exit bar.
