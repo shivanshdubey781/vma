@@ -322,7 +322,28 @@ def ensure_vma_housekeeping():
         [("updated_at", DESCENDING)],
         name="vma_active_trades_updated_at",
     )
+    db["vma_logs"].create_index(
+        [("timestamp", DESCENDING)],
+        name="vma_logs_timestamp",
+    )
     _mongo_housekeeping_ready = True
+
+
+def log_to_db(level: str, message: str, exc: Exception | None = None):
+    """Log an event or error to MongoDB `vma_logs` collection."""
+    try:
+        db = get_db()
+        doc = {
+            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            "level": level,
+            "message": message,
+            "exception": str(exc) if exc else None,
+            "session_id": getattr(_sim, "session_id", None),
+        }
+        db["vma_logs"].insert_one(doc)
+    except Exception:
+        pass
+
 
 
 def archive_expired_vma_results():
@@ -348,6 +369,14 @@ def archive_expired_vma_results():
     )
     # Delete any closed trades in active trades collection
     db[VMA_ACTIVE_TRADES_COLLECTION].delete_many({"status": "CLOSED"})
+    
+    # Delete logs older than 3 days to keep DB size small
+    try:
+        log_cutoff = (datetime.now(IST) - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+        db["vma_logs"].delete_many({"timestamp": {"$lt": log_cutoff}})
+    except Exception:
+        pass
+
 
 
 def prune_non_trade_vma_history():
@@ -718,6 +747,8 @@ def _sim_complete_trade(exit_price: float, exit_ts: str, reason: str):
         pass  # don't crash the tick if DB write fails
 
     _sim.status_msg = f"Trade closed: {reason} @ {_round2(exit_price)}"
+    log_to_db("INFO", f"Trade closed: {pos['type']} @ exit {_round2(exit_price)} ({reason})")
+
 
 
 def _get_live_ltp(pos: dict, fallback_bar: dict | None = None) -> float:
@@ -931,6 +962,7 @@ def _sim_process_bar(bar: dict):
             # PREVIOUS bar and retry THIS bar on the next tick — preserving
             # the signal rather than permanently skipping it.
             _sim.status_msg = f"LTP fetch failed — will retry: {exc}"
+            log_to_db("WARNING", f"LTP fetch failed for options {signal} on bar {ts} — will retry", exc)
             raise _LTPError(str(exc)) from exc
 
         _sim.position = {
@@ -970,6 +1002,8 @@ def _sim_process_bar(bar: dict):
         }
 
     _sim.status_msg = f"Position opened: {signal} @ {_round2(entry)}"
+    log_to_db("INFO", f"Position opened: {signal} @ {entry} (option contract: {contract})")
+
 
     # Persist active trade to MongoDB so it survives a server restart
     try:
@@ -1036,6 +1070,8 @@ def _server_tick():
 
         except Exception as exc:
             _sim.status_msg = f"Tick error: {exc}"
+            log_to_db("ERROR", "Background tick error", exc)
+
 
     # Reschedule — stop ticking after EOD window
     now_hhmm = datetime.now(IST).hour * 100 + datetime.now(IST).minute
@@ -1116,6 +1152,8 @@ def _start_server_sim(params: dict, tf: str, refresh_ms: int = 10000,
             )
         else:
             _sim.status_msg = "Simulation started."
+            log_to_db("INFO", f"Simulation session started: TF={tf}, params={_sim.params}")
+
 
     # Kick off the first tick immediately (outside lock to avoid deadlock)
     threading.Thread(target=_server_tick, daemon=True).start()
@@ -1143,8 +1181,11 @@ def _stop_server_sim(reason: str = "MANUAL"):
                 reason,
             ) if _sim.position else None
         _sim.status_msg = f"Simulation stopped ({reason}). Open position closed and saved."
+        log_to_db("INFO", f"Simulation stopped ({reason}). Active position was closed.")
     else:
         _sim.status_msg = f"Simulation stopped ({reason})."
+        log_to_db("INFO", f"Simulation stopped ({reason}).")
+
 
 
 def restore_sim_from_db():
@@ -1210,6 +1251,19 @@ def _on_first_request():
 def api_sim_state():
     """Return the full server-side simulation state. All browsers poll this."""
     return jsonify({"ok": True, "sim": _sim.to_dict()})
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Expose MongoDB vma_logs collection to browser for easy debugging."""
+    limit = int(request.args.get("limit", 150))
+    try:
+        db = get_db()
+        logs = list(db["vma_logs"].find({}, {"_id": 0}).sort("timestamp", -1).limit(limit))
+        return jsonify({"ok": True, "logs": logs})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.route("/api/sim-control", methods=["POST"])
