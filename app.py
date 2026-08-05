@@ -1050,17 +1050,18 @@ def _server_tick():
             for bar in new_bars:
                 try:
                     _sim_process_bar(bar)
-                    # Only advance last_ts after successful (or cleanly-skipped)
-                    # processing so LTP retries work correctly.
+                    # Advance last_ts after successful (or cleanly-skipped) processing
                     _sim.last_ts = bar["timestamp"]
-                except _LTPError:
-                    # Angel One LTP unavailable for this bar.
-                    # Break WITHOUT advancing last_ts so the same bar is
-                    # retried on the next tick — the signal is preserved.
-                    break
+                except _LTPError as exc:
+                    # Angel One LTP unavailable — advance last_ts so we don't
+                    # retry the same bar every tick forever. The next bar (which
+                    # often has the same signal via confirm_signal) is tried
+                    # immediately on this same tick via 'continue'.
+                    _sim.last_ts = bar["timestamp"]
+                    _sim_log_skip(bar, f"LTP fetch failed — bar skipped: {exc}")
+                    continue
                 except Exception as exc:
-                    # Unexpected error: advance last_ts anyway so the bot
-                    # does not retry this bar forever.
+                    # Unexpected error: advance last_ts to avoid infinite retry
                     _sim.last_ts = bar["timestamp"]
                     _sim.status_msg = f"Bar error (skipped): {exc}"
                     break
